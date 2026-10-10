@@ -73,15 +73,31 @@ python Python/16_performance_report.py --journal path/to/trade-journal.jsonl
 | `--json-out PATH` | Also write the report as strict JSON. |
 | `--max-risk-pct FLOAT` | Realized-risk threshold for the verdict. Default `2.0`. |
 
-Exit codes are `0` on success, `1` when the journal is missing or unreadable, and `2`
-for invalid arguments. A `--variant` value that matches no trade exits `0` and reports
-zero trades: an empty result is a finding, not a failure.
+Exit codes are `0` on success, `1` when the journal is missing, unreadable, or yielded
+no usable row, and `2` for invalid arguments. A `--variant` value that matches no trade
+exits `0` and reports zero trades: an empty result is a finding, not a failure.
 
-The text report goes to standard output. `--json-out` writes the same content as JSON
+The text report goes to standard output. `--json-out` writes the same report as JSON
 with six top-level keys — `metrics`, `filters`, `risk_verdict`, `exit_quality`,
 `groups`, `warnings` — and `filters` records the parameters used, so a saved report
 stays interpretable on its own. Non-finite ratios are written as the string `"inf"`
 rather than the bare `Infinity` literal, which is not valid JSON.
+
+**Units in the JSON payload are mixed and the key names do not all say so.** Read this
+before consuming the file:
+
+- `win_rate` is a **fraction between 0 and 1**. Multiply by 100 to display it.
+- Every key ending in `_pct`, plus `max_risk_pct`, `realized_min`, `realized_median`,
+  `realized_max` and `cost_pct_of_gross`, is **already 0 to 100**. Do not scale again.
+- `total_spread_pips` is in pips, not currency. Every other `total_*` key is money in the
+  account currency.
+- `mfe` is non-negative and `mae` is non-positive, both in price units.
+- A `null` means the value is undefined rather than zero — `cost_pct_of_gross` is `null`
+  when gross profit is not positive, where `0.0` would falsely claim costs consumed
+  nothing.
+
+Guessing wrong on `win_rate` reports a 28.57% win rate as either 0.29% or 2857%, and
+nothing downstream will object.
 
 ## Reading the report
 
@@ -145,14 +161,39 @@ which is the only thing this verdict measures.
 
 | Code | Meaning |
 | --- | --- |
-| `truncated_line` | A line was incomplete JSON and was discarded. Expected after an interrupted write. |
+| `truncated_line` | A line was not valid JSON and was discarded. Only a partial **final** line is attributed to an interrupted write; a malformed line elsewhere in the file points at a corrupt producer or a bad edit. |
 | `unknown_field` | A record carried fields this version does not define. They are ignored so an older analyzer can read a newer journal. |
 | `duplicate_position` | A `position_id` appeared more than once. Both rows are kept, so counts may be inflated. |
 | `rejected_row` | A record failed a required-field, type, range, or ordering check and was excluded. |
+| `inconsistent_pnl` | `net_profit` did not equal `gross_profit + commission + swap` within one cent. The row is kept, but the `CORE` and `COST` sections would otherwise contradict each other silently. |
+| `balance_divergence` | The recorded `balance_at_open` values do not follow from each other. Reported once per journal, not per row. |
 
-Warnings never abort a run, and they are always listed in the report. A journal whose
-warnings were silently dropped would look clean while reporting on a subset of its own
-data.
+Warnings never abort a run, and the report always states how many there were. The
+**rendered** list is capped at 20 with a per-code rollup for the remainder, because a
+large journal whose rows all carry one unrecognized field would otherwise push every
+metric megabytes below the section that is supposed to be read first. The `--json-out`
+payload deliberately keeps **every** warning: it is read by a program, and truncating it
+would discard the data a consumer needs.
+
+If a journal has content but **no** usable row, that is an error rather than a result:
+the analyzer exits `1` and names the reason. A zero-trade report that exits successfully
+would let a pipeline record a pass on data it never read — most often a
+`journal_version` mismatch against a newer producer. An empty file, by contrast, exits
+`0` and reports zero trades.
+
+A leading UTF-8 byte-order mark is stripped rather than treated as content. Without
+that, a journal re-saved by a Windows editor or by PowerShell's `Out-File -Encoding utf8`
+loses its first trade and reports the loss as a malformed line.
+
+### The drawdown assumption
+
+`max_drawdown_abs` and `max_drawdown_pct` describe one event: the percentage is taken at
+the peak that preceded the largest absolute gap, not tracked separately. The equity curve
+they are computed from is reconstructed from the first trade's `balance_at_open` plus
+each net result, which is exact for **one strategy on one account with no cash
+movements**. A deposit, a withdrawal, or a second strategy sharing the account breaks
+that reconstruction, and the analyzer reports `balance_divergence` when the recorded
+balances say it happened. Read the drawdown figures only when that warning is absent.
 
 A journal that cannot be read as UTF-8 at all is an error rather than a warning. MT5
 writes UTF-16 when a file handle is opened with `FILE_UNICODE`; the analyzer detects the
