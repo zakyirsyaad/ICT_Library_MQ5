@@ -480,7 +480,10 @@ class ReportTests(unittest.TestCase):
         text = self.render()
         for key in self.report.GROUP_KEYS:
             with self.subTest(key=key):
-                self.assertIn(key, text.lower())
+                # "BY <key>" not just "<key>": bare "variant" also occurs in the
+                # FILTERS block and "trigger" inside the value "no-trigger", so
+                # the weaker assertion passed even with the section deleted.
+                self.assertIn(f"BY {key}", text)
 
     def test_money_and_percentages_use_two_decimals(self):
         text = self.render()
@@ -564,6 +567,299 @@ class CliTests(unittest.TestCase):
             with redirect_stderr(io.StringIO()):
                 self.report.main([])
         self.assertEqual(ctx.exception.code, 2)
+
+
+def write_journal(directory, rows):
+    """Write rows as a JSONL journal and return its path."""
+    path = Path(directory) / "journal.jsonl"
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    return path
+
+
+class ReviewFixTests(unittest.TestCase):
+    """Regression tests for the findings of the whole-branch review.
+
+    Each test reproduces one finding against the code as it stood before the
+    fix, so a revert turns the suite red rather than silently reintroducing a
+    misleading number.
+    """
+
+    def setUp(self):
+        self.report = load_report_module()
+        self.trades, self.warnings = self.report.load_journal(FIXTURE)
+        self.rows = valid_fixture_rows()
+
+    def rows_with(self, index, **changes):
+        rows = [dict(row) for row in self.rows]
+        rows[index].update(changes)
+        return rows
+
+    # --- Finding 1: cost share reported a false 0.00% on a losing run ---
+
+    def test_cost_share_is_undefined_when_gross_is_not_positive(self):
+        losing = [replace(t, gross_profit=-100.0, commission=-30.0, swap=-20.0)
+                  for t in self.trades]
+        metrics = self.report.compute_metrics(losing)
+        self.assertLess(metrics["total_gross"], 0)
+        self.assertIsNone(metrics["cost_pct_of_gross"])
+        text = self.report.render_report(
+            self.report.build_report(losing, [], NO_FILTERS))
+        self.assertIn("cost as % of gross", text)
+        self.assertIn("n/a", text)
+
+    def test_cost_share_still_zero_for_an_empty_journal(self):
+        self.assertEqual(self.report.compute_metrics([])["cost_pct_of_gross"], 0.0)
+
+    # --- Finding 2: drawdown abs and pct were independent maxima ---
+
+    def test_drawdown_percentage_is_paired_with_the_absolute_maximum(self):
+        """A growing account must not report a pairing that never happened.
+
+        Equity 100 -> 90 (gap 10 at peak 100) -> 2090 -> 2040 (gap 50 at peak
+        2090). The largest absolute drawdown is 50, which was 2.39% of its own
+        peak. Reporting 50 alongside the 10% from the earlier, smaller drawdown
+        describes an event that never occurred and overstates risk on exactly
+        the compounding accounts this tool is used on.
+        """
+        grown = [
+            replace(self.trades[0], balance_at_open=100.0, net_profit=-10.0),
+            replace(self.trades[1], net_profit=2000.0),
+            replace(self.trades[2], net_profit=-50.0),
+            replace(self.trades[3], net_profit=0.0),
+        ]
+        metrics = self.report.compute_metrics(grown)
+        self.assertAlmostEqual(metrics["max_drawdown_abs"], 50.0, places=9)
+        self.assertAlmostEqual(metrics["max_drawdown_pct"], 50.0 / 2090 * 100, places=9)
+
+    def test_fixture_drawdown_pairing_is_unchanged(self):
+        metrics = self.report.compute_metrics(self.trades)
+        self.assertAlmostEqual(metrics["max_drawdown_abs"], 17.5, places=9)
+        self.assertAlmostEqual(metrics["max_drawdown_pct"], 17.5 / 510 * 100, places=9)
+
+    # --- Finding 3: a target hit but eaten by costs read as never reached ---
+
+    def test_target_reached_counts_a_hit_eaten_by_costs(self):
+        """The metric answers 'did price travel to the target', not 'did it pay'.
+
+        Commission decides net_profit, price travel decides whether the target
+        was reached. Coupling them understates target reach precisely on small
+        accounts, where commission is large relative to gross, and pushes a
+        reader to move the target closer for the wrong reason.
+        """
+        eaten = replace(self.trades[1], exit_reason="tp", exit_price=2662.0,
+                        mfe=10.0, gross_profit=0.20, commission=-0.35,
+                        swap=0.0, net_profit=-0.15)
+        quality = self.report.compute_exit_quality([eaten])
+        self.assertEqual(quality["tp_reached_before_sl_count"], 1)
+
+    # --- Finding 4: a UTF-8 BOM silently discarded the first trade ---
+
+    def test_utf8_bom_does_not_discard_the_first_trade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "journal.jsonl"
+            path.write_bytes(b"\xef\xbb\xbf" + FIXTURE.read_bytes())
+            trades, warnings = self.report.load_journal(path)
+        self.assertEqual(len(trades), 7)
+        self.assertEqual(trades[0].ticket, 100001)
+        # The fixture's own truncated line 8 still warns; what must not happen
+        # is the BOM turning line 1 into an unparsable record.
+        truncated = [w.line_number for w in warnings if w.code == "truncated_line"]
+        self.assertEqual(truncated, [8])
+
+    def test_malformed_middle_line_is_not_blamed_on_an_interrupted_write(self):
+        """Only a trailing partial line is plausibly an interrupted write.
+
+        A malformed line in the middle of a journal means something else — a
+        corrupt producer, a bad edit — and naming the wrong cause sends the
+        reader looking for a crash that never happened.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "journal.jsonl"
+            lines = [json.dumps(row) for row in self.rows]
+            lines.insert(1, '{"journal_version": "1.0", "ticket": ')
+            lines.append('{"journal_version": "1.0", "ticket": 999')
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            trades, warnings = self.report.load_journal(path)
+        self.assertEqual(len(trades), 7)
+        messages = {w.line_number: w.message
+                    for w in warnings if w.code == "truncated_line"}
+        self.assertEqual(sorted(messages), [2, 9])
+        self.assertNotIn("interrupted write", messages[2])
+        self.assertIn("interrupted write", messages[9])
+
+    # --- Finding 5: uncapped warnings and a zero report that exits 0 ---
+
+    def test_rendered_warning_list_is_capped_with_a_rollup(self):
+        many = [self.rows_with(0, journal_version="9.9")[0] for _ in range(25)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_journal(tmp, many)
+            trades, warnings = self.report.load_journal(path)
+        self.assertEqual(trades, [])
+        self.assertEqual(len(warnings), 25)
+        text = self.report.render_report(
+            self.report.build_report(trades, warnings, NO_FILTERS))
+        detail = [line for line in text.splitlines() if line.startswith("    ")]
+        self.assertLessEqual(len(detail), self.report.MAX_RENDERED_WARNINGS + 1)
+        self.assertIn("more", text)
+        self.assertIn("rejected_row", text)
+
+    def test_all_rows_rejected_exits_one_with_a_diagnosis(self):
+        rows = [self.rows_with(0, journal_version="9.9")[0] for _ in range(3)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_journal(tmp, rows)
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = self.report.main(["--journal", str(path)])
+        self.assertEqual(code, 1)
+        self.assertIn("rejected", err.getvalue())
+
+    def test_empty_journal_file_still_exits_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "empty.jsonl"
+            path.write_text("", encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = self.report.main(["--journal", str(path)])
+        self.assertEqual(code, 0)
+
+    # --- Finding 6: the documented P&L identity was never checked ---
+
+    def test_pnl_identity_violation_warns(self):
+        rows = self.rows_with(0, net_profit=9999.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_journal(tmp, rows)
+            trades, warnings = self.report.load_journal(path)
+        self.assertEqual(len(trades), 7)
+        inconsistent = [w for w in warnings if w.code == "inconsistent_pnl"]
+        self.assertEqual(len(inconsistent), 1)
+        self.assertEqual(inconsistent[0].line_number, 1)
+
+    def test_pnl_identity_tolerates_rounding(self):
+        rows = self.rows_with(0, net_profit=10.004)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_journal(tmp, rows)
+            _, warnings = self.report.load_journal(path)
+        self.assertNotIn("inconsistent_pnl", [w.code for w in warnings])
+
+    # --- Finding 7: reconstructed equity versus recorded balances ---
+
+    def test_balance_divergence_warns_once_for_the_whole_journal(self):
+        """The fixture mixes a $500 and a $20 account, so divergence is real.
+
+        One aggregated warning rather than one per row: six near-identical lines
+        would bury the two warnings the fixture exists to demonstrate.
+        """
+        diverging = [w for w in self.warnings if w.code == "balance_divergence"]
+        self.assertEqual(len(diverging), 1)
+        self.assertIsNone(diverging[0].line_number)
+        self.assertIn("cash movement", diverging[0].message)
+
+    def test_consistent_balances_produce_no_divergence_warning(self):
+        rows = [dict(row) for row in self.rows]
+        balance = 500.0
+        for row in rows:
+            row["balance_at_open"] = balance
+            balance += row["net_profit"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_journal(tmp, rows)
+            _, warnings = self.report.load_journal(path)
+        self.assertNotIn("balance_divergence", [w.code for w in warnings])
+
+    # --- Finding 8: only field names were guarded against schema drift ---
+
+    def test_enums_match_schema(self):
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        for field, allowed in self.report._ENUMS.items():
+            with self.subTest(field=field):
+                self.assertEqual(list(allowed), schema["properties"][field]["enum"])
+
+    def test_sign_bounds_match_schema(self):
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        properties = schema["properties"]
+        for field in self.report._POSITIVE:
+            with self.subTest(field=field):
+                self.assertEqual(properties[field].get("exclusiveMinimum"), 0)
+        for field in self.report._NON_NEGATIVE:
+            with self.subTest(field=field):
+                self.assertEqual(properties[field].get("minimum"), 0)
+        for field in self.report._NON_POSITIVE:
+            with self.subTest(field=field):
+                self.assertEqual(properties[field].get("maximum"), 0)
+
+    # --- Finding 12: unreadable paths raised tracebacks ---
+
+    def test_directory_as_journal_returns_one_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = self.report.main(["--journal", tmp])
+        self.assertEqual(code, 1)
+        self.assertIn("error:", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_unwritable_json_out_returns_one_without_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "absent-dir" / "metrics.json"
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = self.report.main(
+                    ["--journal", str(FIXTURE), "--json-out", str(target)])
+        self.assertEqual(code, 1)
+        self.assertIn("error:", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    # --- Finding 14: a zero-trade report rendered plausible-looking zeros ---
+
+    def test_zero_trade_report_renders_rates_as_unavailable(self):
+        """Nothing measured must not render as a measured zero.
+
+        `0.00` reads as "breaks even"; `n/a` reads as "no data". Sums are the
+        exception: the total of nothing really is zero.
+        """
+        text = self.report.render_report(
+            self.report.build_report([], [], NO_FILTERS))
+        core = text.split("CORE", 1)[1].split("COST", 1)[0]
+
+        def line_for(label):
+            return next(line for line in core.splitlines()
+                        if line.strip().startswith(label))
+
+        for label in ("expectancy / trade", "win rate", "profit factor",
+                      "payoff ratio", "avg win", "avg loss", "largest win",
+                      "largest loss", "max drawdown"):
+            self.assertIn("n/a", line_for(label), label)
+        self.assertIn("0.00", line_for("total net"))
+        self.assertEqual(line_for("max consecutive losses").strip().split()[-1], "0")
+
+    # --- Findings 17 and 18: group values and warnings pinned independently ---
+
+    def test_variant_full_group_metrics_match_hand_computation(self):
+        full = self.report.group_by(self.trades, "variant")["full"]
+        self.assertEqual(full["trade_count"], 6)
+        self.assertAlmostEqual(full["total_net"], 7.5, places=9)
+        self.assertAlmostEqual(full["expectancy"], 1.25, places=9)
+        self.assertAlmostEqual(full["profit_factor"], 20.0 / 12.5, places=9)
+        self.assertAlmostEqual(full["win_rate"], 2 / 6, places=9)
+        self.assertAlmostEqual(full["max_drawdown_abs"], 12.5, places=9)
+        self.assertAlmostEqual(full["max_drawdown_pct"], 12.5 / 510 * 100, places=9)
+
+    def test_thursday_group_metrics_match_hand_computation(self):
+        thursday = self.report.group_by(self.trades, "weekday")["Thursday"]
+        self.assertEqual(thursday["trade_count"], 2)
+        self.assertAlmostEqual(thursday["total_net"], -10.0, places=9)
+        # Seeds from row 5's balance of 20.0: equity 20 -> 15 -> 10, peak 20.
+        self.assertAlmostEqual(thursday["max_drawdown_abs"], 10.0, places=9)
+        self.assertAlmostEqual(thursday["max_drawdown_pct"], 50.0, places=9)
+
+    def test_duplicate_position_warning_reaches_the_rendered_report(self):
+        rows = [dict(row) for row in self.rows]
+        rows[1]["position_id"] = rows[0]["position_id"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_journal(tmp, rows)
+            trades, warnings = self.report.load_journal(path)
+        text = self.report.render_report(
+            self.report.build_report(trades, warnings, NO_FILTERS))
+        self.assertIn("duplicate_position", text)
 
 
 if __name__ == "__main__":

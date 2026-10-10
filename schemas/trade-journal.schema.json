@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/xxvw/SMC_ICT_Library/blob/main/schemas/trade-journal.schema.json",
   "title": "SMC/ICT trade journal record, version 1",
-  "description": "One closed trade appended as one JSON line to a trade journal. Timestamps are broker-local wall-clock times, without a UTC suffix or offset. Unknown properties are permitted for additive version 1 extensions. The `default` annotations document producer defaults only; a consumer must not use them to repair an incomplete record. Semantic invariants that JSON Schema cannot express (finite numbers, close_time >= open_time, entry_price > 0) are enforced by the analyzer, not here.",
+  "description": "One closed trade appended as one JSON line to a trade journal. Timestamps are broker-local wall-clock times, without a UTC suffix or offset. Unknown properties are permitted for additive version 1 extensions. The `default` annotations document producer defaults only; a consumer must not use them to repair an incomplete record. Semantic invariants that JSON Schema cannot express are enforced by the analyzer, not here: finite numbers, close_time >= open_time, entry_price > 0, and net_profit == gross_profit + commission + swap within one cent.",
   "type": "object",
   "required": [
     "journal_version",

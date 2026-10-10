@@ -3,9 +3,10 @@ Trade Journal Performance Report
 DATA QUALITY
   trades analysed : 7
   sufficient data : no - insufficient (7 of 100 trades required for a statistical verdict)
-  warnings        : 2
+  warnings        : 3
     line 7 [unknown_field] ignoring unrecognized fields for forward compatibility: broker_tag
-    line 8 [truncated_line] discarded incomplete JSON line (Unterminated string starting at, column 89); an interrupted write leaves a partial trailing line
+    line 8 [truncated_line] discarded a line that is not valid JSON (Unterminated string starting at, column 89); an interrupted write leaves a partial trailing line
+    journal [balance_divergence] balance_at_open diverges from the reconstructed equity curve on 6 of 7 trades (first at ticket 100002); the drawdown figures assume one account with no deposit, withdrawal, or second strategy, and a cash movement or shared account breaks that assumption
 
 CORE
   expectancy / trade     : 0.36

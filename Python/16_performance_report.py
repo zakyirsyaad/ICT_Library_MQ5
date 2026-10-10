@@ -23,6 +23,7 @@ import math
 import re
 import statistics
 import sys
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime
@@ -30,6 +31,10 @@ from pathlib import Path
 
 JOURNAL_VERSION = "1.0"
 MIN_TRADES_FOR_VERDICT = 100
+
+# One cent. Money comparisons in this module are equality checks on values a
+# terminal rounded independently, so they need a tolerance rather than `==`.
+MONEY_TOLERANCE = 0.01
 
 # Same pattern as $defs.timestamp in schemas/snapshot.schema.json: broker-local
 # wall-clock, no "Z" and no offset.
@@ -118,13 +123,14 @@ _NON_POSITIVE = ("mae",)
 
 @dataclass(frozen=True)
 class JournalWarning:
-    """A non-fatal problem with one journal line.
+    """A non-fatal problem with a journal.
 
-    Empty string, None, 0 and an absent field all mean different things in this
-    contract, so a warning is never a substitute for a rejected row.
+    `line_number` is None for a warning about the journal as a whole rather than
+    one row. Empty string, None, 0 and an absent field all mean different things
+    in this contract, so a warning is never a substitute for a rejected row.
     """
 
-    line_number: int
+    line_number: int | None
     code: str
     message: str
 
@@ -182,7 +188,7 @@ def _validate_ranges(row: dict, problems: list[str]) -> None:
             problems.append(f"{name} must not be positive")
 
 
-def _validate_invariants(row: dict, parsed: dict, problems: list[str]) -> None:
+def _validate_invariants(parsed: dict, problems: list[str]) -> None:
     open_time = parsed["open_time"]
     close_time = parsed["close_time"]
     if open_time is None or close_time is None:
@@ -218,13 +224,56 @@ def _parse_row(row: object, line_number: int) -> tuple[Trade | None, list[Journa
     parsed = {name: _parse_timestamp(row[name]) for name in _TIME_FIELDS}
     _validate_types(row, problems)
     _validate_ranges(row, problems)
-    _validate_invariants(row, parsed, problems)
+    _validate_invariants(parsed, problems)
     if problems:
         return None, warnings + [JournalWarning(line_number, "rejected_row", "; ".join(problems))]
 
     values = {name: row[name] for name in TRADE_FIELDS if name not in _TIME_FIELDS}
     values.update(parsed)
-    return Trade(**values), warnings
+    trade = Trade(**values)
+    expected_net = trade.gross_profit + trade.commission + trade.swap
+    if abs(trade.net_profit - expected_net) > MONEY_TOLERANCE:
+        # A warning, not a rejection: the row is usable, but CORE and COST would
+        # quietly contradict each other and expectancy is built on net_profit.
+        warnings.append(JournalWarning(
+            line_number, "inconsistent_pnl",
+            f"net_profit {trade.net_profit} does not equal gross_profit + commission "
+            f"+ swap ({expected_net:.2f})",
+        ))
+    return trade, warnings
+
+
+def _balance_divergence(trades: Sequence[Trade]) -> JournalWarning | None:
+    """Compare the reconstructed equity curve against each recorded balance.
+
+    The drawdown metrics rebuild equity from the first trade's balance plus each
+    net result. That is exact for one strategy on one account with no cash
+    movements, and silently wrong otherwise — a deposit, a withdrawal, or a
+    second strategy sharing the account all break it while every row's real
+    balance sits unread in the data. One aggregated warning rather than one per
+    row, so a long journal does not bury its other warnings.
+    """
+    ordered = _chronological(trades)
+    if not ordered:
+        return None
+    equity = ordered[0].balance_at_open
+    count = 0
+    first_ticket = None
+    for index, trade in enumerate(ordered):
+        if index and abs(trade.balance_at_open - equity) > MONEY_TOLERANCE:
+            count += 1
+            if first_ticket is None:
+                first_ticket = trade.ticket
+        equity += trade.net_profit
+    if not count:
+        return None
+    return JournalWarning(
+        None, "balance_divergence",
+        f"balance_at_open diverges from the reconstructed equity curve on {count} of "
+        f"{len(ordered)} trades (first at ticket {first_ticket}); the drawdown figures "
+        "assume one account with no deposit, withdrawal, or second strategy, and a "
+        "cash movement or shared account breaks that assumption",
+    )
 
 
 def load_journal(path: Path) -> tuple[list[Trade], list[JournalWarning]]:
@@ -233,51 +282,80 @@ def load_journal(path: Path) -> tuple[list[Trade], list[JournalWarning]]:
     Rows are returned in file order; sorting is the metrics layer's concern.
     A malformed line yields a warning and is skipped, never an exception, so a
     partial write from an interrupted terminal cannot lose the rest of the run.
+
+    The file is streamed rather than read whole. Holding the bytes, the decoded
+    text, and a list of every line at once costs roughly four times the file
+    size, and a multi-year M1 backtest can produce a journal of hundreds of
+    megabytes.
     """
-    raw = Path(path).read_bytes()
-    if raw[:2] in _UTF16_BOMS:
-        raise JournalFormatError(
-            f"{path}: file is UTF-16 encoded (BOM detected). MT5 writes UTF-16 when a "
-            "handle is opened with FILE_UNICODE; reopen the journal without FILE_UNICODE "
-            "so it is written as UTF-8."
-        )
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise JournalFormatError(
-            f"{path}: not valid UTF-8 ({exc}). If the journal came from MT5, check whether "
-            "it was written with FILE_UNICODE, which produces UTF-16."
-        ) from exc
+    path = Path(path)
+    with path.open("rb") as probe:
+        if probe.read(2) in _UTF16_BOMS:
+            raise JournalFormatError(
+                f"{path}: file is UTF-16 encoded (BOM detected). MT5 writes UTF-16 "
+                "when a handle is opened with FILE_UNICODE; reopen the journal "
+                "without FILE_UNICODE so it is written as UTF-8."
+            )
 
     trades: list[Trade] = []
     warnings: list[JournalWarning] = []
     first_seen: dict[int, int] = {}
-    for line_number, line in enumerate(text.splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except json.JSONDecodeError as exc:
-            warnings.append(JournalWarning(
-                line_number, "truncated_line",
-                f"discarded incomplete JSON line ({exc.msg}, column {exc.colno}); "
-                "an interrupted write leaves a partial trailing line",
-            ))
-            continue
-        trade, row_warnings = _parse_row(row, line_number)
-        warnings.extend(row_warnings)
-        if trade is None:
-            continue
-        earlier = first_seen.get(trade.position_id)
-        if earlier is None:
-            first_seen[trade.position_id] = line_number
-        else:
-            warnings.append(JournalWarning(
-                line_number, "duplicate_position",
-                f"position_id {trade.position_id} was already recorded on line {earlier}; "
-                "both rows are kept, so trade counts may be inflated",
-            ))
-        trades.append(trade)
+    last_line = 0
+    try:
+        # utf-8-sig strips a leading BOM when present and is byte-identical
+        # otherwise; without it a BOM makes line 1 unparsable and silently drops
+        # the first trade. Iterating the handle splits only on newlines, so a
+        # U+2028 inside a JSON string cannot split a record the way splitlines().
+        with path.open(encoding="utf-8-sig") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    continue
+                last_line = line_number
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    warnings.append(JournalWarning(
+                        line_number, "truncated_line",
+                        f"discarded a line that is not valid JSON ({exc.msg}, "
+                        f"column {exc.colno})",
+                    ))
+                    continue
+                trade, row_warnings = _parse_row(row, line_number)
+                warnings.extend(row_warnings)
+                if trade is None:
+                    continue
+                earlier = first_seen.get(trade.position_id)
+                if earlier is None:
+                    first_seen[trade.position_id] = line_number
+                else:
+                    warnings.append(JournalWarning(
+                        line_number, "duplicate_position",
+                        f"position_id {trade.position_id} was already recorded on line "
+                        f"{earlier}; both rows are kept, so trade counts may be inflated",
+                    ))
+                trades.append(trade)
+    except UnicodeDecodeError as exc:
+        raise JournalFormatError(
+            f"{path}: not valid UTF-8 ({exc}). If the journal came from MT5, check "
+            "whether it was written with FILE_UNICODE, which produces UTF-16."
+        ) from exc
+
+    # Only a partial final line is plausibly an interrupted write. Blaming every
+    # unparsable line on one sends the reader looking for a crash that never
+    # happened and away from the real cause, which is a corrupt producer or edit.
+    if last_line:
+        warnings = [
+            JournalWarning(
+                warning.line_number, warning.code,
+                warning.message + "; an interrupted write leaves a partial trailing line",
+            ) if warning.code == "truncated_line" and warning.line_number == last_line
+            else warning
+            for warning in warnings
+        ]
+
+    divergence = _balance_divergence(trades)
+    if divergence is not None:
+        warnings.append(divergence)
     return trades, warnings
 
 
@@ -310,9 +388,12 @@ def compute_metrics(trades: Sequence[Trade]) -> dict[str, object]:
       because that is the order capital actually moved in.
     - `cost_pct_of_gross` counts commission and swap only. Spread is already
       inside the entry and exit prices that produced `gross_profit`, so adding
-      it would double-count; spread is reported separately in pips.
-    - `max_drawdown_abs` and `max_drawdown_pct` are independent maxima over the
-      equity curve, so they may occur at different points.
+      it would double-count; spread is reported separately in pips. It is `None`
+      when gross is not positive, because a share of a non-positive gross is
+      undefined and a losing run is an expected outcome, not an edge case.
+    - `max_drawdown_pct` is the percentage of the *same* drawdown that
+      `max_drawdown_abs` measures, taken at the peak that preceded it. The two
+      always describe one real event.
     - Every rate degrades to 0.0 on an empty input rather than raising.
     """
     ordered = _chronological(trades)
@@ -348,9 +429,14 @@ def compute_metrics(trades: Sequence[Trade]) -> dict[str, object]:
             equity += trade.net_profit
             peak = max(peak, equity)
             gap = peak - equity
-            drawdown_abs = max(drawdown_abs, gap)
-            if peak > 0:
-                drawdown_pct = max(drawdown_pct, gap / peak * 100)
+            if gap > drawdown_abs:
+                drawdown_abs = gap
+                # Captured at the point the absolute maximum is set, so the pair
+                # describes one real drawdown. Tracking the two independently
+                # would report the worst absolute gap alongside the worst
+                # percentage from a different, possibly much smaller event —
+                # which on a growing account overstates risk systematically.
+                drawdown_pct = gap / peak * 100 if peak > 0 else 0.0
 
     cost = -(total_commission + total_swap)
     return {
@@ -371,7 +457,13 @@ def compute_metrics(trades: Sequence[Trade]) -> dict[str, object]:
         "total_spread_pips": math.fsum(trade.spread_at_entry for trade in ordered),
         "total_commission": total_commission,
         "total_swap": total_swap,
-        "cost_pct_of_gross": cost / total_gross * 100 if total_gross > 0 else 0.0,
+        # Undefined once gross is not positive, and a losing run is an expected
+        # outcome rather than an edge case. Reporting 0.0 there would state that
+        # costs consumed none of the result, which is a definite-looking answer
+        # to a question that has no answer. An empty journal is genuinely 0.0.
+        "cost_pct_of_gross": (
+            cost / total_gross * 100 if total_gross > 0 else (0.0 if not count else None)
+        ),
         "sufficient_data": count >= MIN_TRADES_FOR_VERDICT,
     }
 
@@ -477,9 +569,13 @@ def compute_exit_quality(trades: Sequence[Trade]) -> dict[str, object]:
     """Report how exits behaved relative to the levels that were set.
 
     `tp_reached_before_sl_count` counts trades whose favourable excursion
-    reached at least the target distance and which closed positive. A low count
-    relative to trade_count suggests targets are placed beyond where price
-    actually travels.
+    reached at least the target distance. It deliberately ignores whether the
+    trade was profitable: the question this answers is "is the target placed
+    beyond where price actually travels", which is about price, while
+    `net_profit` is about cost. Coupling them would understate target reach
+    precisely on small accounts, where commission is large relative to gross,
+    and push a reader to move the target closer for the wrong reason. A low
+    count relative to trade_count suggests targets are too far.
 
     `sl_exceeded_before_favourable_count` counts trades whose adverse excursion
     reached the stop distance. Comparing it against the winners among them
@@ -503,7 +599,6 @@ def compute_exit_quality(trades: Sequence[Trade]) -> dict[str, object]:
         "tp_reached_before_sl_count": sum(
             1 for trade in trades
             if trade.tp > 0
-            and trade.net_profit > 0
             and trade.mfe >= abs(trade.tp - trade.entry_price)
         ),
         "sl_exceeded_before_favourable_count": sum(
@@ -635,19 +730,55 @@ def _group_section(key: str, groups: Mapping[str, Mapping[str, object]]) -> list
     return [f"BY {key}"] + _table((key, *_GROUP_COLUMNS), rows)
 
 
+MAX_RENDERED_WARNINGS = 20
+
+
+def _warning_lines(warnings: Sequence[Mapping[str, object]]) -> list[str]:
+    """Render warnings, capped, with a per-code rollup for the remainder.
+
+    An uncapped list is not a cosmetic problem. A large journal whose rows all
+    carry one forward-compatible extra field, or all carry a newer
+    journal_version, produces one warning per row; tens of thousands of them
+    push every metric megabytes below the DATA QUALITY header that is supposed
+    to be read first.
+    """
+    shown = warnings[:MAX_RENDERED_WARNINGS]
+    lines = []
+    for warning in shown:
+        number = warning["line_number"]
+        where = "journal" if number is None else f"line {number}"
+        lines.append(f"    {where} [{warning['code']}] {warning['message']}")
+    hidden = len(warnings) - len(shown)
+    if hidden:
+        rollup = ", ".join(
+            f"{count} x {code}"
+            for code, count in sorted(Counter(w["code"] for w in warnings).items())
+        )
+        lines.append(f"    ... {hidden} more not shown ({rollup})")
+    return lines
+
+
 def render_report(report: Mapping[str, object]) -> str:
     """Render a built report as human-readable text ending in a single newline.
 
-    Data quality comes first: a reader must see the sample size, whether it is
-    sufficient, and any journal warnings before seeing any performance number.
-    Metrics presented above an unnoticed "7 of 100 trades" line get trusted as
-    conclusions.
+    Data quality comes first, and it should be read first: a reader must see the
+    sample size, whether it is sufficient, and any journal warnings before seeing
+    any performance number. A metric read without that context is not a
+    conclusion.
+
+    Rate metrics render as `n/a` when there are no trades. `0.00` would read as
+    "measured, and it breaks even" rather than "nothing was measured". Sums keep
+    `0.00`, because the total of nothing genuinely is zero.
     """
     metrics = report["metrics"]
     verdict = report["risk_verdict"]
     quality = report["exit_quality"]
     report_warnings = report["warnings"]
     trade_count = metrics["trade_count"]
+    unmeasured = trade_count == 0
+
+    def rate(value: object, formatter=_number) -> str:
+        return "n/a" if unmeasured else formatter(value)
 
     sufficient = "yes" if metrics["sufficient_data"] else (
         f"no - insufficient ({trade_count} of {MIN_TRADES_FOR_VERDICT} trades "
@@ -660,23 +791,20 @@ def render_report(report: Mapping[str, object]) -> str:
         ("sufficient data", sufficient),
         ("warnings", str(len(report_warnings))),
     ])
-    lines += [
-        f"    line {warning['line_number']} [{warning['code']}] {warning['message']}"
-        for warning in report_warnings
-    ]
+    lines += _warning_lines(report_warnings)
 
     lines += ["", "CORE"]
     lines += _key_value([
-        ("expectancy / trade", _number(metrics["expectancy"])),
-        ("win rate", _fraction_as_pct(metrics["win_rate"])),
-        ("profit factor", _number(metrics["profit_factor"])),
-        ("payoff ratio", _number(metrics["payoff_ratio"])),
-        ("avg win", _number(metrics["avg_win"])),
-        ("avg loss", _number(metrics["avg_loss"])),
-        ("largest win", _number(metrics["largest_win"])),
-        ("largest loss", _number(metrics["largest_loss"])),
+        ("expectancy / trade", rate(metrics["expectancy"])),
+        ("win rate", rate(metrics["win_rate"], _fraction_as_pct)),
+        ("profit factor", rate(metrics["profit_factor"])),
+        ("payoff ratio", rate(metrics["payoff_ratio"])),
+        ("avg win", rate(metrics["avg_win"])),
+        ("avg loss", rate(metrics["avg_loss"])),
+        ("largest win", rate(metrics["largest_win"])),
+        ("largest loss", rate(metrics["largest_loss"])),
         ("max consecutive losses", str(metrics["max_consecutive_losses"])),
-        ("max drawdown",
+        ("max drawdown", "n/a" if unmeasured else
          f"{_number(metrics['max_drawdown_abs'])} ({_pct(metrics['max_drawdown_pct'])})"),
         ("total net", _number(metrics["total_net"])),
     ])
@@ -727,11 +855,13 @@ def render_report(report: Mapping[str, object]) -> str:
 def main(argv: Sequence[str] | None = None) -> int:
     """Command line entry point.
 
-    Exit codes: 0 on success, 1 when the journal is missing or unreadable,
-    and 2 for invalid arguments (raised by argparse).
+    Exit codes: 0 on success, 1 when the journal is missing, unreadable, or
+    yielded no usable row, and 2 for invalid arguments (raised by argparse).
 
     A variant that matches no trades is a successful run reporting zero trades,
-    not an error: "this configuration produced nothing" is a finding.
+    not an error: "this configuration produced nothing" is a finding. A journal
+    whose rows were all rejected is different — the file had content and none of
+    it could be read, which is a failure to report rather than a result.
     """
     parser = argparse.ArgumentParser(
         description="Report performance metrics from an MQL5 trade journal.",
@@ -749,11 +879,25 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         trades, warnings = load_journal(args.journal)
+    except JournalFormatError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     except FileNotFoundError:
         print(f"error: journal not found: {args.journal}", file=sys.stderr)
         return 1
-    except JournalFormatError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except OSError as exc:
+        # A directory, a permission problem, or a vanished mount. Without this
+        # the user gets a traceback, and the documented exit code 1 would only
+        # hold by accident via SystemExit(main()).
+        print(f"error: cannot read journal {args.journal}: {exc}", file=sys.stderr)
+        return 1
+
+    if not trades and warnings:
+        rollup = ", ".join(f"{count} x {code}" for code, count in
+                           sorted(Counter(w.code for w in warnings).items()))
+        print(f"error: every journal line was rejected or unreadable ({rollup}); "
+              "no trades to report. A journal_version mismatch against a newer "
+              "producer is the usual cause.", file=sys.stderr)
         return 1
 
     if args.variant is not None:
@@ -767,10 +911,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     sys.stdout.write(render_report(report))
 
     if args.json_out is not None:
-        # allow_nan=False makes the strict-JSON guarantee enforced rather than
-        # assumed; build_report sanitizes, so this should never trigger.
-        args.json_out.write_text(
-            json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        try:
+            # allow_nan=False makes the strict-JSON guarantee enforced rather
+            # than assumed; build_report sanitizes, so this should never trigger.
+            args.json_out.write_text(
+                json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"error: cannot write JSON report to {args.json_out}: {exc}",
+                  file=sys.stderr)
+            return 1
     return 0
 
 
