@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 import jsonschema
@@ -169,6 +170,137 @@ class JournalParserTests(unittest.TestCase):
         duplicates = [w for w in warnings if w.code == "duplicate_position"]
         self.assertEqual(len(duplicates), 1)
         self.assertEqual(duplicates[0].line_number, 2)
+
+
+class MetricsTests(unittest.TestCase):
+    """Every expected value here is computed by hand from the 8 fixture rows.
+
+    Fixture in close_time order: W(+10), L(-5), BE(0), L(-2.5), L(-5), L(-5), W(+10).
+    Balances are 500 except row 5, which is 20 to exercise the small-account case.
+    """
+
+    def setUp(self):
+        self.report = load_report_module()
+        self.trades, _ = self.report.load_journal(FIXTURE)
+
+    def metrics(self, trades=None):
+        return self.report.compute_metrics(self.trades if trades is None else trades)
+
+    def test_core_metrics_match_hand_computed_values(self):
+        m = self.metrics()
+        self.assertEqual(m["trade_count"], 7)
+        self.assertAlmostEqual(m["total_net"], 2.5, places=9)
+        self.assertAlmostEqual(m["win_rate"], 2 / 7, places=9)
+        self.assertAlmostEqual(m["expectancy"], 2.5 / 7, places=9)
+        self.assertAlmostEqual(m["avg_win"], 10.0, places=9)
+        self.assertAlmostEqual(m["avg_loss"], -4.375, places=9)
+        self.assertAlmostEqual(m["largest_win"], 10.0, places=9)
+        self.assertAlmostEqual(m["largest_loss"], -5.0, places=9)
+        self.assertAlmostEqual(m["profit_factor"], 20.0 / 17.5, places=9)
+        self.assertAlmostEqual(m["payoff_ratio"], 10.0 / 4.375, places=9)
+
+    def test_break_even_counts_as_neither_win_nor_loss(self):
+        m = self.metrics()
+        # row 3 has net_profit 0.0: 2 wins and 4 losses out of 7, not 3 and 4
+        self.assertAlmostEqual(m["win_rate"], 2 / 7, places=9)
+        self.assertAlmostEqual(m["avg_loss"], -17.5 / 4, places=9)
+
+    def test_cost_pct_of_gross_uses_commission_and_swap_only(self):
+        m = self.metrics()
+        self.assertAlmostEqual(m["total_gross"], 4.5, places=9)
+        self.assertAlmostEqual(m["total_commission"], -1.7, places=9)
+        self.assertAlmostEqual(m["total_swap"], -0.3, places=9)
+        self.assertAlmostEqual(m["cost_pct_of_gross"], 2.0 / 4.5 * 100, places=9)
+        # Spread is already inside the entry/exit prices that produced gross_profit,
+        # so adding it to cost would double-count. It is reported in pips instead.
+        self.assertAlmostEqual(m["total_spread_pips"], 19.5, places=9)
+
+    def test_max_consecutive_losses_counts_run_not_total(self):
+        # W, L, BE, L, L, L, W -> longest run is 3 even though there are 4 losers
+        self.assertEqual(self.metrics()["max_consecutive_losses"], 3)
+
+    def test_max_drawdown_matches_hand_computed_equity_curve(self):
+        m = self.metrics()
+        # equity: 500 510 505 505 502.5 497.5 492.5 502.5, peak 510
+        self.assertAlmostEqual(m["max_drawdown_abs"], 17.5, places=9)
+        self.assertAlmostEqual(m["max_drawdown_pct"], 17.5 / 510 * 100, places=9)
+
+    def test_below_threshold_flags_insufficient_data(self):
+        self.assertFalse(self.metrics()["sufficient_data"])
+
+    def test_at_threshold_flags_sufficient_data(self):
+        threshold = self.report.MIN_TRADES_FOR_VERDICT
+        many = (self.trades * ((threshold // len(self.trades)) + 1))[:threshold]
+        self.assertEqual(len(many), threshold)
+        self.assertTrue(self.report.compute_metrics(many)["sufficient_data"])
+
+    def test_empty_journal_returns_zero_metrics_without_raising(self):
+        m = self.report.compute_metrics([])
+        self.assertEqual(m["trade_count"], 0)
+        self.assertFalse(m["sufficient_data"])
+        for key in ("win_rate", "expectancy", "profit_factor", "payoff_ratio",
+                    "avg_win", "avg_loss", "max_drawdown_abs", "max_drawdown_pct",
+                    "cost_pct_of_gross"):
+            self.assertEqual(m[key], 0.0, key)
+
+    def test_all_wins_and_all_losses_do_not_raise(self):
+        wins = [replace(t, net_profit=abs(t.net_profit) + 1.0) for t in self.trades]
+        self.assertEqual(self.metrics(wins)["profit_factor"], float("inf"))
+        losses = [replace(t, net_profit=-(abs(t.net_profit) + 1.0)) for t in self.trades]
+        m = self.metrics(losses)
+        self.assertEqual(m["profit_factor"], 0.0)
+        self.assertEqual(m["payoff_ratio"], 0.0)
+        self.assertEqual(m["avg_win"], 0.0)
+
+
+class RiskVerdictTests(unittest.TestCase):
+    def setUp(self):
+        self.report = load_report_module()
+        self.trades, _ = self.report.load_journal(FIXTURE)
+
+    def test_risk_verdict_uses_losers_only(self):
+        v = self.report.compute_risk_verdict(self.trades)
+        self.assertEqual(v["n_losers"], 4)
+        self.assertAlmostEqual(v["realized_min"], 0.5, places=9)
+        self.assertAlmostEqual(v["realized_median"], 1.0, places=9)
+        self.assertAlmostEqual(v["realized_max"], 25.0, places=9)
+        self.assertEqual(v["exceedances"], 1)
+        self.assertAlmostEqual(v["max_risk_pct"], 2.0, places=9)
+        self.assertEqual(v["verdict"], "risk_exceeded")
+
+    def test_risk_verdict_answers_even_below_sample_threshold(self):
+        """Risk realization is a structural sizing question, not a statistical one.
+
+        One trade losing 25% against an intended 1% already proves the broker's lot
+        step makes the requested risk unreachable, so the verdict must not wait for
+        MIN_TRADES_FOR_VERDICT the way expectancy does.
+        """
+        self.assertLess(len(self.trades), self.report.MIN_TRADES_FOR_VERDICT)
+        self.assertFalse(self.report.compute_metrics(self.trades)["sufficient_data"])
+        self.assertEqual(self.report.compute_risk_verdict(self.trades)["verdict"],
+                         "risk_exceeded")
+
+    def test_risk_verdict_without_losers_is_insufficient_data(self):
+        wins = [replace(t, net_profit=abs(t.net_profit) + 1.0) for t in self.trades]
+        v = self.report.compute_risk_verdict(wins)
+        self.assertEqual(v["n_losers"], 0)
+        self.assertEqual(v["verdict"], "insufficient_data")
+
+    def test_contained_risk_verdict_when_within_threshold(self):
+        # The $500-account rows realize 1.0% or less; drop the $20 row and the
+        # default 2.0% threshold is respected.
+        contained = [t for t in self.trades if t.balance_at_open > 100.0]
+        v = self.report.compute_risk_verdict(contained)
+        self.assertAlmostEqual(v["realized_max"], 1.0, places=9)
+        self.assertEqual(v["exceedances"], 0)
+        self.assertEqual(v["verdict"], "risk_contained")
+
+    def test_threshold_is_configurable(self):
+        # 25.0% is contained only by an absurd threshold, which proves the
+        # parameter is actually consulted rather than hardcoded.
+        v = self.report.compute_risk_verdict(self.trades, max_risk_pct=30.0)
+        self.assertEqual(v["verdict"], "risk_contained")
+        self.assertAlmostEqual(v["max_risk_pct"], 30.0, places=9)
 
 
 if __name__ == "__main__":

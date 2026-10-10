@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import math
 import re
+import statistics
+from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime
 from pathlib import Path
@@ -275,3 +277,140 @@ def load_journal(path: Path) -> tuple[list[Trade], list[JournalWarning]]:
             ))
         trades.append(trade)
     return trades, warnings
+
+
+def _chronological(trades: Sequence[Trade]) -> list[Trade]:
+    """Order trades by close time, breaking ties deterministically on ticket."""
+    return sorted(trades, key=lambda trade: (trade.close_time, trade.ticket))
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    """Divide without raising; an undefined ratio reports infinity or zero.
+
+    A zero denominator with a positive numerator means "no losing side exists",
+    which is unbounded rather than unknown, so it reports infinity. Both zero
+    means there is nothing to compare.
+    """
+    if denominator:
+        return numerator / denominator
+    return float("inf") if numerator > 0 else 0.0
+
+
+def compute_metrics(trades: Sequence[Trade]) -> dict[str, object]:
+    """Compute performance metrics for a set of closed trades.
+
+    Conventions, all pinned by tests:
+
+    - A win is `net_profit > 0` and a loss is `net_profit < 0`. A break-even
+      trade (`net_profit == 0.0`) is neither, so it does not inflate the win
+      rate and it breaks a losing streak.
+    - Streaks and the equity curve use `close_time` order, not file order,
+      because that is the order capital actually moved in.
+    - `cost_pct_of_gross` counts commission and swap only. Spread is already
+      inside the entry and exit prices that produced `gross_profit`, so adding
+      it would double-count; spread is reported separately in pips.
+    - `max_drawdown_abs` and `max_drawdown_pct` are independent maxima over the
+      equity curve, so they may occur at different points.
+    - Every rate degrades to 0.0 on an empty input rather than raising.
+    """
+    ordered = _chronological(trades)
+    count = len(ordered)
+    wins = [trade.net_profit for trade in ordered if trade.net_profit > 0]
+    losses = [trade.net_profit for trade in ordered if trade.net_profit < 0]
+
+    total_net = math.fsum(trade.net_profit for trade in ordered)
+    total_gross = math.fsum(trade.gross_profit for trade in ordered)
+    total_commission = math.fsum(trade.commission for trade in ordered)
+    total_swap = math.fsum(trade.swap for trade in ordered)
+    gross_wins = math.fsum(wins)
+    gross_losses = math.fsum(losses)
+
+    avg_win = gross_wins / len(wins) if wins else 0.0
+    avg_loss = gross_losses / len(losses) if losses else 0.0
+
+    streak = 0
+    worst_streak = 0
+    for trade in ordered:
+        if trade.net_profit < 0:
+            streak += 1
+            worst_streak = max(worst_streak, streak)
+        else:
+            streak = 0
+
+    drawdown_abs = 0.0
+    drawdown_pct = 0.0
+    if ordered:
+        equity = ordered[0].balance_at_open
+        peak = equity
+        for trade in ordered:
+            equity += trade.net_profit
+            peak = max(peak, equity)
+            gap = peak - equity
+            drawdown_abs = max(drawdown_abs, gap)
+            if peak > 0:
+                drawdown_pct = max(drawdown_pct, gap / peak * 100)
+
+    cost = -(total_commission + total_swap)
+    return {
+        "trade_count": count,
+        "win_rate": len(wins) / count if count else 0.0,
+        "expectancy": total_net / count if count else 0.0,
+        "profit_factor": _ratio(gross_wins, -gross_losses),
+        "payoff_ratio": _ratio(avg_win, -avg_loss),
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "largest_win": max(wins) if wins else 0.0,
+        "largest_loss": min(losses) if losses else 0.0,
+        "max_consecutive_losses": worst_streak,
+        "max_drawdown_abs": drawdown_abs,
+        "max_drawdown_pct": drawdown_pct,
+        "total_net": total_net,
+        "total_gross": total_gross,
+        "total_spread_pips": math.fsum(trade.spread_at_entry for trade in ordered),
+        "total_commission": total_commission,
+        "total_swap": total_swap,
+        "cost_pct_of_gross": cost / total_gross * 100 if total_gross > 0 else 0.0,
+        "sufficient_data": count >= MIN_TRADES_FOR_VERDICT,
+    }
+
+
+def compute_risk_verdict(trades: Sequence[Trade],
+                         max_risk_pct: float = 2.0) -> dict[str, object]:
+    """Report whether realized risk per losing trade stayed inside max_risk_pct.
+
+    This answers a structural question, not a statistical one: whether the
+    broker's minimum lot step lets the EA actually achieve the risk it asked
+    for. A single trade losing 25% against an intended 1% already proves it
+    cannot, so the verdict deliberately ignores MIN_TRADES_FOR_VERDICT — that
+    threshold gates expectancy, where sample size really does matter.
+
+    Only losing trades are measured. A winning trade's realized risk is 0 by
+    definition, and averaging winners in would hide the sizing problem.
+    `exceedances` counts losers whose realized risk strictly exceeds their own
+    intended risk, so a trade landing exactly on target does not count.
+    """
+    losers = [trade for trade in trades if trade.net_profit < 0]
+    realized = [trade.realized_risk_pct for trade in losers]
+    if not losers:
+        return {
+            "n_losers": 0,
+            "realized_min": 0.0,
+            "realized_median": 0.0,
+            "realized_max": 0.0,
+            "exceedances": 0,
+            "max_risk_pct": max_risk_pct,
+            "verdict": "insufficient_data",
+        }
+    realized_max = max(realized)
+    return {
+        "n_losers": len(losers),
+        "realized_min": min(realized),
+        "realized_median": statistics.median(realized),
+        "realized_max": realized_max,
+        "exceedances": sum(
+            1 for trade in losers
+            if trade.realized_risk_pct > trade.intended_risk_pct
+        ),
+        "max_risk_pct": max_risk_pct,
+        "verdict": "risk_exceeded" if realized_max > max_risk_pct else "risk_contained",
+    }
