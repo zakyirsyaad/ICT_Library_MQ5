@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xxvw/SMC_ICT_Library/blob/main/schemas/trade-journal.schema.json",
+  "title": "SMC/ICT trade journal record, version 1",
+  "description": "One closed trade appended as one JSON line to a trade journal. Timestamps are broker-local wall-clock times, without a UTC suffix or offset. Unknown properties are permitted for additive version 1 extensions. The `default` annotations document producer defaults only; a consumer must not use them to repair an incomplete record. Semantic invariants that JSON Schema cannot express (finite numbers, close_time >= open_time, entry_price > 0) are enforced by the analyzer, not here.",
+  "type": "object",
+  "required": [
+    "journal_version",
+    "ticket",
+    "position_id",
+    "symbol",
+    "timeframe",
+    "magic",
+    "variant",
+    "config_hash",
+    "open_time",
+    "close_time",
+    "direction",
+    "bars_held",
+    "lot",
+    "entry_price",
+    "sl",
+    "tp",
+    "exit_price",
+    "exit_reason",
+    "spread_at_entry",
+    "slippage_points",
+    "gross_profit",
+    "commission",
+    "swap",
+    "net_profit",
+    "balance_at_open",
+    "equity_at_open",
+    "margin_used",
+    "intended_risk_pct",
+    "realized_risk_pct",
+    "mfe",
+    "mae",
+    "htf_trend",
+    "zone_percent",
+    "in_ote",
+    "zone_types",
+    "trigger",
+    "session",
+    "confluence_score",
+    "confluence_count"
+  ],
+  "properties": {
+    "journal_version": {"const": "1.0"},
+    "ticket": {"type": "integer"},
+    "position_id": {"type": "integer"},
+    "symbol": {"type": "string", "minLength": 1},
+    "timeframe": {"type": "string", "minLength": 1},
+    "magic": {"type": "integer"},
+    "variant": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Ablation label identifying which strategy layers were active, e.g. \"full\" or \"no-trigger\"."
+    },
+    "config_hash": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Digest of the EA parameter set that produced this trade, so a saved report can be traced back to its inputs."
+    },
+    "open_time": {"$ref": "#/$defs/timestamp"},
+    "close_time": {"$ref": "#/$defs/timestamp"},
+    "direction": {"type": "integer", "enum": [1, -1], "description": "1 long, -1 short."},
+    "bars_held": {"type": "integer", "minimum": 0},
+    "lot": {"type": "number", "exclusiveMinimum": 0},
+    "entry_price": {"type": "number", "exclusiveMinimum": 0},
+    "sl": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Stop loss price. 0 means no stop was set; it is not interchangeable with an absent field."
+    },
+    "tp": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Take profit price. 0 means no target was set."
+    },
+    "exit_price": {"type": "number", "exclusiveMinimum": 0},
+    "exit_reason": {
+      "type": "string",
+      "enum": ["sl", "tp", "signal", "time_stop", "be_stop", "manual", "unknown"]
+    },
+    "spread_at_entry": {"type": "number", "minimum": 0, "description": "Spread in pips at entry."},
+    "slippage_points": {"type": "number", "description": "Signed; may be negative."},
+    "gross_profit": {"type": "number"},
+    "commission": {"type": "number"},
+    "swap": {"type": "number"},
+    "net_profit": {"type": "number", "description": "gross_profit + commission + swap as reported by the terminal."},
+    "balance_at_open": {"type": "number", "exclusiveMinimum": 0},
+    "equity_at_open": {"type": "number", "exclusiveMinimum": 0},
+    "margin_used": {"type": "number", "minimum": 0},
+    "intended_risk_pct": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Risk the EA asked for, e.g. SmcConfig InpRiskPercent."
+    },
+    "realized_risk_pct": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Actual outcome as a percentage of balance_at_open. Meaningful for losing trades; the gap against intended_risk_pct is what exposes lot-step granularity limits."
+    },
+    "mfe": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Maximum favourable excursion in price units, measured from entry_price over the bars the position was open. Non-negative by definition."
+    },
+    "mae": {
+      "type": "number",
+      "maximum": 0,
+      "description": "Maximum adverse excursion in price units, measured from entry_price. Non-positive by definition, so a stop at distance d is breached when mae <= -d."
+    },
+    "htf_trend": {"type": "string", "enum": ["bullish", "bearish", "ranging", "unknown"]},
+    "zone_percent": {
+      "type": "number",
+      "description": "CSmcPremiumDiscount::GetZonePercent() at entry: 0 = swing low, 50 = equilibrium, 100 = swing high."
+    },
+    "in_ote": {"type": "boolean", "description": "CSmcOptimalTradeEntry::IsInOTEZone() at entry."},
+    "zone_types": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Pipe-delimited overlapping zone types at entry, e.g. \"OB|BPR|IFVG\". \"none\" when no zone qualified; never an empty string."
+    },
+    "trigger": {
+      "type": "string",
+      "enum": ["displacement", "mss", "po3_distribution", "liq_sweep", "none", "unknown"]
+    },
+    "session": {
+      "type": "string",
+      "enum": ["Asian", "London", "NewYork", "none", "unknown"],
+      "description": "Broker-local session label at entry. Labels are not time-zone conversions."
+    },
+    "confluence_score": {"type": "number"},
+    "confluence_count": {"type": "integer", "minimum": 0}
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$"
+    }
+  }
+}
