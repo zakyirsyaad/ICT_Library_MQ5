@@ -303,5 +303,106 @@ class RiskVerdictTests(unittest.TestCase):
         self.assertAlmostEqual(v["max_risk_pct"], 30.0, places=9)
 
 
+class GroupingTests(unittest.TestCase):
+    def setUp(self):
+        self.report = load_report_module()
+        self.trades, _ = self.report.load_journal(FIXTURE)
+
+    def test_variant_groups_report_sample_size(self):
+        groups = self.report.group_by(self.trades, "variant")
+        self.assertEqual(set(groups), {"full", "no-trigger"})
+        self.assertEqual(groups["full"]["trade_count"], 6)
+        self.assertEqual(groups["no-trigger"]["trade_count"], 1)
+
+    def test_group_values_are_full_metric_dicts(self):
+        groups = self.report.group_by(self.trades, "variant")
+        whole = self.report.compute_metrics(self.trades)
+        self.assertEqual(set(groups["full"]), set(whole))
+
+    def test_session_groups_match_fixture_counts(self):
+        groups = self.report.group_by(self.trades, "session")
+        self.assertEqual({name: g["trade_count"] for name, g in groups.items()},
+                         {"London": 4, "NewYork": 2, "Asian": 1})
+
+    def test_hour_groups_are_zero_padded_so_they_sort(self):
+        groups = self.report.group_by(self.trades, "hour")
+        # Row 7 opens 2026-09-18T10:00:00; row 5 opens at 02:15.
+        self.assertEqual(sorted(groups), ["02", "08", "09", "10", "13", "14", "15"])
+
+    def test_weekday_groups_are_locale_independent_english(self):
+        groups = self.report.group_by(self.trades, "weekday")
+        self.assertEqual({name: g["trade_count"] for name, g in groups.items()},
+                         {"Monday": 2, "Tuesday": 1, "Wednesday": 1,
+                          "Thursday": 2, "Friday": 1})
+
+    def test_weekday_groups_are_ordered_chronologically_not_alphabetically(self):
+        # The rendered report and its golden file depend on this order.
+        groups = self.report.group_by(self.trades, "weekday")
+        self.assertEqual(list(groups),
+                         ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"])
+
+    def test_every_groupable_key_partitions_all_trades(self):
+        for key in self.report.GROUPABLE_KEYS:
+            with self.subTest(key=key):
+                groups = self.report.group_by(self.trades, key)
+                self.assertEqual(sum(g["trade_count"] for g in groups.values()), 7)
+
+    def test_unknown_key_raises_rather_than_returning_empty(self):
+        with self.assertRaises(ValueError):
+            self.report.group_by(self.trades, "not_a_field")
+
+    def test_empty_input_gives_empty_groups(self):
+        self.assertEqual(self.report.group_by([], "variant"), {})
+
+
+class ExitQualityTests(unittest.TestCase):
+    def setUp(self):
+        self.report = load_report_module()
+        self.trades, _ = self.report.load_journal(FIXTURE)
+
+    def test_exit_reason_counts_cover_every_trade(self):
+        q = self.report.compute_exit_quality(self.trades)
+        self.assertEqual(sum(q["exit_reason_counts"].values()), 7)
+        self.assertEqual(q["exit_reason_counts"]["sl"], 3)
+        self.assertEqual(q["exit_reason_counts"]["tp"], 2)
+        self.assertEqual(q["exit_reason_counts"]["be_stop"], 1)
+        self.assertEqual(q["exit_reason_counts"]["time_stop"], 1)
+
+    def test_exit_reason_counts_always_emit_every_reason(self):
+        """A stable row set keeps the rendered report comparable across runs."""
+        q = self.report.compute_exit_quality(self.trades[:1])
+        self.assertEqual(list(q["exit_reason_counts"]), list(self.report.EXIT_REASONS))
+        self.assertEqual(q["exit_reason_counts"]["manual"], 0)
+
+    def test_tp_reach_count_matches_hand_computed_rows(self):
+        # Only rows 1 and 7 have mfe >= |tp - entry| (10.0) and a positive net.
+        q = self.report.compute_exit_quality(self.trades)
+        self.assertEqual(q["tp_reached_before_sl_count"], 2)
+
+    def test_sl_breach_count_matches_hand_computed_rows(self):
+        # Rows 2, 5 and 6 have mae <= -|entry - sl| (-5.0); all three exited on sl.
+        q = self.report.compute_exit_quality(self.trades)
+        self.assertEqual(q["sl_exceeded_before_favourable_count"], 3)
+
+    def test_mfe_mae_use_median_not_mean(self):
+        q = self.report.compute_exit_quality(self.trades)
+        # mfe sorted: 0.8 1.5 2.0 3.0 6.5 10.0 10.0 -> median 3.0 (mean would be 4.83)
+        self.assertAlmostEqual(q["median_mfe"], 3.0, places=9)
+        # mae sorted: -5.0 -5.0 -5.0 -2.5 -2.0 -1.2 -0.5 -> median -2.5
+        self.assertAlmostEqual(q["median_mae"], -2.5, places=9)
+
+    def test_trades_without_a_target_are_excluded_from_tp_reach(self):
+        no_target = [replace(t, tp=0.0) for t in self.trades]
+        q = self.report.compute_exit_quality(no_target)
+        self.assertEqual(q["tp_reached_before_sl_count"], 0)
+
+    def test_empty_input_gives_zeroed_exit_quality(self):
+        q = self.report.compute_exit_quality([])
+        self.assertEqual(q["tp_reached_before_sl_count"], 0)
+        self.assertEqual(q["sl_exceeded_before_favourable_count"], 0)
+        self.assertEqual(q["median_mfe"], 0.0)
+        self.assertEqual(q["median_mae"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

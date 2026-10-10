@@ -414,3 +414,100 @@ def compute_risk_verdict(trades: Sequence[Trade],
         "max_risk_pct": max_risk_pct,
         "verdict": "risk_exceeded" if realized_max > max_risk_pct else "risk_contained",
     }
+
+
+EXIT_REASONS = _ENUMS["exit_reason"]
+
+# strftime("%A") follows the process locale, so weekday names come from a fixed
+# table. Without it the same journal would render different group labels on a
+# machine with a non-English locale, and the golden output would not reproduce.
+_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+_DERIVED_KEYS = ("hour", "weekday")
+GROUPABLE_KEYS = (
+    "variant", "session", "htf_trend", "trigger", "exit_reason",
+) + _DERIVED_KEYS
+
+
+def _group_value(trade: Trade, key: str) -> str:
+    if key == "hour":
+        # Zero-padded so lexicographic order equals chronological order.
+        return f"{trade.open_time.hour:02d}"
+    if key == "weekday":
+        return _WEEKDAYS[trade.open_time.weekday()]
+    return str(getattr(trade, key))
+
+
+def _group_sort_key(key: str, name: str) -> tuple[int, str]:
+    if key == "weekday":
+        return (_WEEKDAYS.index(name), name)
+    return (0, name)
+
+
+def group_by(trades: Sequence[Trade], key: str) -> dict[str, dict[str, object]]:
+    """Partition trades and report full metrics for each subset.
+
+    Each value is exactly `compute_metrics` for that subset, so `trade_count`
+    is already the sample size — no separate `n` is added, and no metric formula
+    is duplicated here.
+
+    `hour` and `weekday` derive from `open_time`, which is broker-local wall
+    clock. It is never converted to another time zone: the session labels a
+    broker reports are the ones being analysed.
+
+    An unknown key raises rather than returning an empty dict, because a silent
+    empty result reads as "no differences found" instead of "wrong key".
+    """
+    if key not in GROUPABLE_KEYS:
+        raise ValueError(
+            f"unknown grouping key {key!r}; expected one of {', '.join(GROUPABLE_KEYS)}"
+        )
+    buckets: dict[str, list[Trade]] = {}
+    for trade in trades:
+        buckets.setdefault(_group_value(trade, key), []).append(trade)
+    return {
+        name: compute_metrics(buckets[name])
+        for name in sorted(buckets, key=lambda item: _group_sort_key(key, item))
+    }
+
+
+def compute_exit_quality(trades: Sequence[Trade]) -> dict[str, object]:
+    """Report how exits behaved relative to the levels that were set.
+
+    `tp_reached_before_sl_count` counts trades whose favourable excursion
+    reached at least the target distance and which closed positive. A low count
+    relative to trade_count suggests targets are placed beyond where price
+    actually travels.
+
+    `sl_exceeded_before_favourable_count` counts trades whose adverse excursion
+    reached the stop distance. Comparing it against the winners among them
+    suggests whether stops sit too close to entry.
+
+    Both counts skip trades with no level set (`tp` or `sl` of 0), because 0
+    means "unset" in this contract and is not a price at distance zero.
+
+    Medians are used rather than means so a single excursion outlier cannot
+    drag the summary. `exit_reason_counts` always emits every reason in
+    `EXIT_REASONS` order, including zeros, so the rendered report has a stable
+    row set across runs.
+    """
+    counts = {reason: 0 for reason in EXIT_REASONS}
+    for trade in trades:
+        counts[trade.exit_reason] += 1
+    mfe_values = [trade.mfe for trade in trades]
+    mae_values = [trade.mae for trade in trades]
+    return {
+        "exit_reason_counts": counts,
+        "tp_reached_before_sl_count": sum(
+            1 for trade in trades
+            if trade.tp > 0
+            and trade.net_profit > 0
+            and trade.mfe >= abs(trade.tp - trade.entry_price)
+        ),
+        "sl_exceeded_before_favourable_count": sum(
+            1 for trade in trades
+            if trade.sl > 0 and trade.mae <= -abs(trade.entry_price - trade.sl)
+        ),
+        "median_mfe": statistics.median(mfe_values) if mfe_values else 0.0,
+        "median_mae": statistics.median(mae_values) if mae_values else 0.0,
+    }
