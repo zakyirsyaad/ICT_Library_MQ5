@@ -21,7 +21,7 @@ import json
 import math
 import re
 import statistics
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime
 from pathlib import Path
@@ -258,7 +258,7 @@ def load_journal(path: Path) -> tuple[list[Trade], list[JournalWarning]]:
         except json.JSONDecodeError as exc:
             warnings.append(JournalWarning(
                 line_number, "truncated_line",
-                f"discarded incomplete JSON line ({exc.msg} at column {exc.colno}); "
+                f"discarded incomplete JSON line ({exc.msg}, column {exc.colno}); "
                 "an interrupted write leaves a partial trailing line",
             ))
             continue
@@ -511,3 +511,212 @@ def compute_exit_quality(trades: Sequence[Trade]) -> dict[str, object]:
         "median_mfe": statistics.median(mfe_values) if mfe_values else 0.0,
         "median_mae": statistics.median(mae_values) if mae_values else 0.0,
     }
+
+
+DEFAULT_MAX_RISK_PCT = 2.0
+
+# Rendered in the report. exit_reason is deliberately absent: its distribution is
+# already reported by exit_quality, and repeating it would show the same numbers twice.
+GROUP_KEYS = ("variant", "session", "htf_trend", "trigger", "hour", "weekday")
+
+_GROUP_COLUMNS = ("n", "expectancy", "win rate", "pf", "max dd", "net")
+
+
+def _json_safe(value: object) -> object:
+    """Replace non-finite floats so the report stays valid strict JSON.
+
+    json.dumps renders infinity as the bare literal `Infinity`, which is not JSON
+    and is rejected by jq and by browsers. Infinite ratios are common rather than
+    exceptional here, because group_by scores small subsets: a group holding one
+    winning trade has no losing side at all.
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return None
+        if math.isinf(value):
+            return "inf" if value > 0 else "-inf"
+        return value
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def build_report(trades: Sequence[Trade],
+                 warnings: Sequence[JournalWarning],
+                 filters: Mapping[str, object]) -> dict[str, object]:
+    """Assemble the JSON-serializable report consumed by render_report.
+
+    `filters` is echoed into the report unchanged. It is recorded because a saved
+    report is only interpretable alongside the parameters that produced it — the
+    same reason each trade carries a config_hash.
+
+    Filtering by variant happens in main() before this call, so the trades passed
+    in are already the selected subset; build_report does not filter again.
+    """
+    settings = dict(filters)
+    threshold = settings.get("max_risk_pct", DEFAULT_MAX_RISK_PCT)
+    return _json_safe({
+        "metrics": compute_metrics(trades),
+        "filters": settings,
+        "risk_verdict": compute_risk_verdict(trades, threshold),
+        "exit_quality": compute_exit_quality(trades),
+        "groups": {name: group_by(trades, name) for name in GROUP_KEYS},
+        "warnings": [
+            {"line_number": warning.line_number, "code": warning.code,
+             "message": warning.message}
+            for warning in warnings
+        ],
+    })
+
+
+def _number(value: object, decimals: int = 2) -> str:
+    """Format a value that may already be a JSON-safe "inf" placeholder string."""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "n/a"
+    return f"{value:.{decimals}f}"
+
+
+def _pct(value: object) -> str:
+    """Format a value already expressed in percent units."""
+    if isinstance(value, str) or value is None:
+        return _number(value)
+    return f"{value:.2f}%"
+
+
+def _fraction_as_pct(value: object) -> str:
+    """Format a 0..1 fraction as a percentage.
+
+    Kept separate from _pct on purpose: win_rate is a fraction while
+    max_drawdown_pct, cost_pct_of_gross and the realized-risk values are already
+    percentages. Multiplying the latter by 100 again is the easy mistake here.
+    """
+    if isinstance(value, str) or value is None:
+        return _number(value)
+    return f"{value * 100:.2f}%"
+
+
+def _key_value(pairs: Sequence[tuple[str, str]]) -> list[str]:
+    width = max(len(label) for label, _ in pairs)
+    return [f"  {label.ljust(width)} : {value}" for label, value in pairs]
+
+
+def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
+    """Render an aligned table: first column left, remaining columns right."""
+    widths = [len(cell) for cell in header]
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+
+    def render(cells: Sequence[str]) -> str:
+        parts = [cells[0].ljust(widths[0])]
+        parts += [cell.rjust(widths[index]) for index, cell in enumerate(cells) if index]
+        return "  " + "  ".join(parts)
+
+    return [render(header)] + [render(row) for row in rows]
+
+
+def _group_section(key: str, groups: Mapping[str, Mapping[str, object]]) -> list[str]:
+    rows = [
+        [name,
+         str(metrics["trade_count"]),
+         _number(metrics["expectancy"]),
+         _fraction_as_pct(metrics["win_rate"]),
+         _number(metrics["profit_factor"]),
+         _pct(metrics["max_drawdown_pct"]),
+         _number(metrics["total_net"])]
+        for name, metrics in groups.items()
+    ]
+    return [f"BY {key}"] + _table((key, *_GROUP_COLUMNS), rows)
+
+
+def render_report(report: Mapping[str, object]) -> str:
+    """Render a built report as human-readable text ending in a single newline.
+
+    Data quality comes first: a reader must see the sample size, whether it is
+    sufficient, and any journal warnings before seeing any performance number.
+    Metrics presented above an unnoticed "7 of 100 trades" line get trusted as
+    conclusions.
+    """
+    metrics = report["metrics"]
+    verdict = report["risk_verdict"]
+    quality = report["exit_quality"]
+    report_warnings = report["warnings"]
+    trade_count = metrics["trade_count"]
+
+    sufficient = "yes" if metrics["sufficient_data"] else (
+        f"no - insufficient ({trade_count} of {MIN_TRADES_FOR_VERDICT} trades "
+        "required for a statistical verdict)"
+    )
+
+    lines = ["Trade Journal Performance Report", "", "DATA QUALITY"]
+    lines += _key_value([
+        ("trades analysed", str(trade_count)),
+        ("sufficient data", sufficient),
+        ("warnings", str(len(report_warnings))),
+    ])
+    lines += [
+        f"    line {warning['line_number']} [{warning['code']}] {warning['message']}"
+        for warning in report_warnings
+    ]
+
+    lines += ["", "CORE"]
+    lines += _key_value([
+        ("expectancy / trade", _number(metrics["expectancy"])),
+        ("win rate", _fraction_as_pct(metrics["win_rate"])),
+        ("profit factor", _number(metrics["profit_factor"])),
+        ("payoff ratio", _number(metrics["payoff_ratio"])),
+        ("avg win", _number(metrics["avg_win"])),
+        ("avg loss", _number(metrics["avg_loss"])),
+        ("largest win", _number(metrics["largest_win"])),
+        ("largest loss", _number(metrics["largest_loss"])),
+        ("max consecutive losses", str(metrics["max_consecutive_losses"])),
+        ("max drawdown",
+         f"{_number(metrics['max_drawdown_abs'])} ({_pct(metrics['max_drawdown_pct'])})"),
+        ("total net", _number(metrics["total_net"])),
+    ])
+
+    lines += ["", "COST"]
+    lines += _key_value([
+        ("total gross", _number(metrics["total_gross"])),
+        ("commission", _number(metrics["total_commission"])),
+        ("swap", _number(metrics["total_swap"])),
+        ("cost as % of gross", _pct(metrics["cost_pct_of_gross"])),
+        ("spread paid (pips)", _number(metrics["total_spread_pips"])),
+    ])
+
+    lines += ["", "RISK REALIZATION"]
+    lines += _key_value([
+        ("losing trades", str(verdict["n_losers"])),
+        ("realized risk min", _pct(verdict["realized_min"])),
+        ("realized risk median", _pct(verdict["realized_median"])),
+        ("realized risk max", _pct(verdict["realized_max"])),
+        ("exceeded intended risk", str(verdict["exceedances"])),
+        ("threshold", _pct(verdict["max_risk_pct"])),
+        ("verdict", str(verdict["verdict"])),
+    ])
+
+    lines += ["", "EXIT QUALITY"]
+    lines += _key_value([
+        ("target reached", str(quality["tp_reached_before_sl_count"])),
+        ("stop breached", str(quality["sl_exceeded_before_favourable_count"])),
+        ("median MFE", _number(quality["median_mfe"])),
+        ("median MAE", _number(quality["median_mae"])),
+    ])
+    counts = quality["exit_reason_counts"]
+    lines.append("  exit reasons : " + " ".join(
+        f"{reason}={counts[reason]}" for reason in EXIT_REASONS))
+
+    for key in GROUP_KEYS:
+        lines += ["", *_group_section(key, report["groups"][key])]
+
+    filters = report["filters"]
+    lines += ["", "FILTERS"]
+    lines += _key_value([
+        ("variant", "(all)" if filters.get("variant") is None else str(filters["variant"])),
+        ("max risk %", _number(filters.get("max_risk_pct", DEFAULT_MAX_RISK_PCT))),
+    ])
+    return "\n".join(lines) + "\n"

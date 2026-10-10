@@ -404,5 +404,88 @@ class ExitQualityTests(unittest.TestCase):
         self.assertEqual(q["median_mae"], 0.0)
 
 
+NO_FILTERS = {"variant": None, "max_risk_pct": 2.0}
+
+
+class ReportTests(unittest.TestCase):
+    def setUp(self):
+        self.report = load_report_module()
+        self.trades, self.warnings = self.report.load_journal(FIXTURE)
+
+    def build(self, trades=None, filters=NO_FILTERS):
+        return self.report.build_report(
+            self.trades if trades is None else trades, self.warnings, filters)
+
+    def render(self, trades=None, filters=NO_FILTERS):
+        return self.report.render_report(self.build(trades, filters))
+
+    def test_report_carries_every_group_key(self):
+        built = self.build()
+        self.assertEqual(set(built), {"metrics", "filters", "risk_verdict",
+                                      "exit_quality", "groups", "warnings"})
+        self.assertEqual(set(built["groups"]), set(self.report.GROUP_KEYS))
+        self.assertEqual(built["groups"]["variant"]["full"]["trade_count"], 6)
+
+    def test_report_is_json_serializable_without_nan(self):
+        """Infinity is not valid JSON, and small groups produce it routinely.
+
+        group_by computes metrics per subset, so a group holding one winning
+        trade has no losing side and profit_factor is infinite. json.dumps would
+        emit the non-standard literal Infinity, which jq and browsers reject.
+        """
+        json.dumps(self.build(), allow_nan=False)
+
+    def test_infinite_ratio_becomes_json_safe_in_the_report(self):
+        wins = [replace(t, net_profit=abs(t.net_profit) + 1.0) for t in self.trades]
+        self.assertEqual(self.report.compute_metrics(wins)["profit_factor"], float("inf"))
+        self.assertEqual(self.build(wins)["metrics"]["profit_factor"], "inf")
+
+    def test_filters_are_carried_into_the_risk_threshold(self):
+        strict = {"variant": None, "max_risk_pct": 0.75}
+        self.assertEqual(self.build(filters=strict)["risk_verdict"]["verdict"],
+                         "risk_exceeded")
+        loose = {"variant": None, "max_risk_pct": 30.0}
+        self.assertEqual(self.build(filters=loose)["risk_verdict"]["verdict"],
+                         "risk_contained")
+
+    def test_rendered_report_matches_expected_fixture(self):
+        expected = EXPECTED.read_text(encoding="utf-8")
+        self.assertEqual(self.render(), expected)
+
+    def test_rendered_report_ends_with_newline(self):
+        self.assertTrue(self.render().endswith("\n"))
+        self.assertFalse(self.render().endswith("\n\n"))
+
+    def test_report_includes_insufficient_data_notice(self):
+        self.assertIn("insufficient", self.render().lower())
+
+    def test_warnings_are_surfaced_in_report(self):
+        text = self.render()
+        self.assertIn("truncated_line", text)
+        self.assertIn("unknown_field", text)
+        self.assertIn("broker_tag", text)
+
+    def test_data_quality_precedes_every_other_section(self):
+        lines = [line for line in self.render().splitlines() if line.strip()]
+        self.assertEqual(lines[1], "DATA QUALITY")
+
+    def test_rendered_report_shows_ablation_table(self):
+        text = self.render()
+        self.assertIn("no-trigger", text)
+        self.assertIn("variant", text)
+
+    def test_rendered_report_shows_every_group_section(self):
+        text = self.render()
+        for key in self.report.GROUP_KEYS:
+            with self.subTest(key=key):
+                self.assertIn(key, text.lower())
+
+    def test_money_and_percentages_use_two_decimals(self):
+        text = self.render()
+        self.assertIn("25.00%", text)     # realized risk max
+        self.assertIn("44.44%", text)     # cost as % of gross
+        self.assertIn("-4.38", text)      # avg loss, rounded from -4.375
+
+
 if __name__ == "__main__":
     unittest.main()

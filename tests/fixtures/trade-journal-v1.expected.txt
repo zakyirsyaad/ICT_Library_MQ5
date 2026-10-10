@@ -1,0 +1,91 @@
+Trade Journal Performance Report
+
+DATA QUALITY
+  trades analysed : 7
+  sufficient data : no - insufficient (7 of 100 trades required for a statistical verdict)
+  warnings        : 2
+    line 7 [unknown_field] ignoring unrecognized fields for forward compatibility: broker_tag
+    line 8 [truncated_line] discarded incomplete JSON line (Unterminated string starting at, column 89); an interrupted write leaves a partial trailing line
+
+CORE
+  expectancy / trade     : 0.36
+  win rate               : 28.57%
+  profit factor          : 1.14
+  payoff ratio           : 2.29
+  avg win                : 10.00
+  avg loss               : -4.38
+  largest win            : 10.00
+  largest loss           : -5.00
+  max consecutive losses : 3
+  max drawdown           : 17.50 (3.43%)
+  total net              : 2.50
+
+COST
+  total gross        : 4.50
+  commission         : -1.70
+  swap               : -0.30
+  cost as % of gross : 44.44%
+  spread paid (pips) : 19.50
+
+RISK REALIZATION
+  losing trades          : 4
+  realized risk min      : 0.50%
+  realized risk median   : 1.00%
+  realized risk max      : 25.00%
+  exceeded intended risk : 1
+  threshold              : 2.00%
+  verdict                : risk_exceeded
+
+EXIT QUALITY
+  target reached : 2
+  stop breached  : 3
+  median MFE     : 3.00
+  median MAE     : -2.50
+  exit reasons : sl=3 tp=2 signal=0 time_stop=1 be_stop=1 manual=0 unknown=0
+
+BY variant
+  variant     n  expectancy  win rate    pf  max dd    net
+  full        6        1.25    33.33%  1.60   2.45%   7.50
+  no-trigger  1       -5.00     0.00%  0.00   1.00%  -5.00
+
+BY session
+  session  n  expectancy  win rate    pf  max dd    net
+  Asian    1       -5.00     0.00%  0.00  25.00%  -5.00
+  London   4        3.75    50.00%  4.00   0.98%  15.00
+  NewYork  2       -3.75     0.00%  0.00   1.50%  -7.50
+
+BY htf_trend
+  htf_trend  n  expectancy  win rate    pf  max dd    net
+  bearish    2       -2.50     0.00%  0.00   1.00%  -5.00
+  bullish    4        2.50    50.00%  2.00   1.96%  10.00
+  ranging    1       -2.50     0.00%  0.00   0.50%  -2.50
+
+BY trigger
+  trigger           n  expectancy  win rate    pf  max dd    net
+  displacement      2        2.50    50.00%  2.00   0.98%   5.00
+  liq_sweep         1       10.00   100.00%   inf   0.00%  10.00
+  mss               1       -5.00     0.00%  0.00   1.00%  -5.00
+  none              2       -3.75     0.00%  0.00   1.50%  -7.50
+  po3_distribution  1        0.00     0.00%  0.00   0.00%   0.00
+
+BY hour
+  hour  n  expectancy  win rate    pf  max dd    net
+  02    1       -5.00     0.00%  0.00  25.00%  -5.00
+  08    1       10.00   100.00%   inf   0.00%  10.00
+  09    1        0.00     0.00%  0.00   0.00%   0.00
+  10    1       10.00   100.00%   inf   0.00%  10.00
+  13    1       -2.50     0.00%  0.00   0.50%  -2.50
+  14    1       -5.00     0.00%  0.00   1.00%  -5.00
+  15    1       -5.00     0.00%  0.00   1.00%  -5.00
+
+BY weekday
+  weekday    n  expectancy  win rate    pf  max dd     net
+  Monday     2        2.50    50.00%  2.00   0.98%    5.00
+  Tuesday    1        0.00     0.00%  0.00   0.00%    0.00
+  Wednesday  1       -2.50     0.00%  0.00   0.50%   -2.50
+  Thursday   2       -5.00     0.00%  0.00  50.00%  -10.00
+  Friday     1       10.00   100.00%   inf   0.00%   10.00
+
+FILTERS
+  variant    : (all)
+  max risk % : 2.00
