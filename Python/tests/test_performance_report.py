@@ -1,10 +1,12 @@
 """Contract and metric tests for the trade journal performance report."""
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 
@@ -485,6 +487,83 @@ class ReportTests(unittest.TestCase):
         self.assertIn("25.00%", text)     # realized risk max
         self.assertIn("44.44%", text)     # cost as % of gross
         self.assertIn("-4.38", text)      # avg loss, rounded from -4.375
+
+
+class CliTests(unittest.TestCase):
+    def setUp(self):
+        self.report = load_report_module()
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = self.report.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def payload(self, argv):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.json"
+            code, _, _ = self.run_main([*argv, "--json-out", str(path)])
+            self.assertEqual(code, 0)
+            return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_main_prints_report_and_returns_zero(self):
+        code, out, _ = self.run_main(["--journal", str(FIXTURE)])
+        self.assertEqual(code, 0)
+        self.assertEqual(out, EXPECTED.read_text(encoding="utf-8"))
+
+    def test_main_filters_by_variant(self):
+        payload = self.payload(["--journal", str(FIXTURE), "--variant", "no-trigger"])
+        self.assertEqual(payload["filters"]["variant"], "no-trigger")
+        self.assertEqual(payload["metrics"]["trade_count"], 1)
+
+    def test_main_writes_json_out_with_six_keys(self):
+        payload = self.payload(["--journal", str(FIXTURE)])
+        self.assertEqual(set(payload), {"metrics", "filters", "risk_verdict",
+                                        "exit_quality", "groups", "warnings"})
+        self.assertEqual(payload["metrics"]["trade_count"], 7)
+
+    def test_json_out_is_strict_json_without_nan_literals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.json"
+            self.run_main(["--journal", str(FIXTURE), "--json-out", str(path)])
+            raw = path.read_text(encoding="utf-8")
+        self.assertNotIn("Infinity", raw)
+        self.assertNotIn("NaN", raw)
+        json.loads(raw, parse_constant=lambda name: self.fail(f"non-finite {name}"))
+
+    def test_max_risk_pct_flows_into_verdict(self):
+        contained = self.payload(["--journal", str(FIXTURE), "--max-risk-pct", "30"])
+        self.assertEqual(contained["risk_verdict"]["verdict"], "risk_contained")
+        exceeded = self.payload(["--journal", str(FIXTURE), "--max-risk-pct", "2"])
+        self.assertEqual(exceeded["risk_verdict"]["verdict"], "risk_exceeded")
+
+    def test_max_risk_pct_defaults_to_two(self):
+        payload = self.payload(["--journal", str(FIXTURE)])
+        self.assertAlmostEqual(payload["filters"]["max_risk_pct"], 2.0, places=9)
+
+    def test_variant_with_no_matches_reports_zero_trades_not_an_error(self):
+        payload = self.payload(["--journal", str(FIXTURE), "--variant", "nonexistent"])
+        self.assertEqual(payload["metrics"]["trade_count"], 0)
+        self.assertFalse(payload["metrics"]["sufficient_data"])
+
+    def test_missing_journal_returns_one(self):
+        code, _, err = self.run_main(["--journal", str(FIXTURE.parent / "absent.jsonl")])
+        self.assertEqual(code, 1)
+        self.assertIn("absent.jsonl", err)
+
+    def test_utf16_journal_returns_one_with_actionable_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "journal.jsonl"
+            path.write_bytes(FIXTURE.read_text(encoding="utf-8").encode("utf-16"))
+            code, _, err = self.run_main(["--journal", str(path)])
+        self.assertEqual(code, 1)
+        self.assertIn("FILE_UNICODE", err)
+
+    def test_invalid_arguments_exit_with_code_two(self):
+        with self.assertRaises(SystemExit) as ctx:
+            with redirect_stderr(io.StringIO()):
+                self.report.main([])
+        self.assertEqual(ctx.exception.code, 2)
 
 
 if __name__ == "__main__":

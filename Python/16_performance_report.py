@@ -17,10 +17,12 @@ they are never converted or reinterpreted as UTC instants.
 """
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import re
 import statistics
+import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime
@@ -720,3 +722,57 @@ def render_report(report: Mapping[str, object]) -> str:
         ("max risk %", _number(filters.get("max_risk_pct", DEFAULT_MAX_RISK_PCT))),
     ])
     return "\n".join(lines) + "\n"
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Command line entry point.
+
+    Exit codes: 0 on success, 1 when the journal is missing or unreadable,
+    and 2 for invalid arguments (raised by argparse).
+
+    A variant that matches no trades is a successful run reporting zero trades,
+    not an error: "this configuration produced nothing" is a finding.
+    """
+    parser = argparse.ArgumentParser(
+        description="Report performance metrics from an MQL5 trade journal.",
+    )
+    parser.add_argument("--journal", required=True, type=Path,
+                        help="path to a trade journal .jsonl file")
+    parser.add_argument("--variant", default=None,
+                        help="analyse only trades carrying this ablation label")
+    parser.add_argument("--json-out", type=Path, default=None,
+                        help="also write the report as strict JSON to this path")
+    parser.add_argument("--max-risk-pct", type=float, default=DEFAULT_MAX_RISK_PCT,
+                        help="realized-risk threshold for the verdict "
+                             f"(default {DEFAULT_MAX_RISK_PCT})")
+    args = parser.parse_args(argv)
+
+    try:
+        trades, warnings = load_journal(args.journal)
+    except FileNotFoundError:
+        print(f"error: journal not found: {args.journal}", file=sys.stderr)
+        return 1
+    except JournalFormatError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    if args.variant is not None:
+        trades = [trade for trade in trades if trade.variant == args.variant]
+
+    report = build_report(
+        trades, warnings,
+        {"variant": args.variant, "max_risk_pct": args.max_risk_pct},
+    )
+    # write, not print: render_report already ends in exactly one newline.
+    sys.stdout.write(render_report(report))
+
+    if args.json_out is not None:
+        # allow_nan=False makes the strict-JSON guarantee enforced rather than
+        # assumed; build_report sanitizes, so this should never trigger.
+        args.json_out.write_text(
+            json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
