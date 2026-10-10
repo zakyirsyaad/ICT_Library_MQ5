@@ -1,9 +1,9 @@
 """
 16 - Performance Report / Trade Journal Analyzer
 ================================================
-Reads a trade journal (JSONL, one closed trade per line) written by the MQL5
-`CSmcTradeJournal` utility and reports expectancy, cost, realized risk, and
-exit quality.
+Reads a trade journal (JSONL, one closed trade per line) conforming to
+`schemas/trade-journal.schema.json` and reports expectancy, cost, realized risk,
+and exit quality.
 
 Detection and journaling stay in MQL5; this script only consumes their output,
 following the same division as the six readers under `examples/`.

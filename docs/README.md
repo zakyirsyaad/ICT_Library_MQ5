@@ -11,6 +11,7 @@ The English guides below describe the current snapshot interface and project rul
 | [Detection rules](ICT_RULES.md) | Exact project definitions, defaults, confirmation, and lifecycle behavior |
 | [Data contract](DATA_CONTRACT.md) | JSON fields, schema versions, broker timestamps, and sample output |
 | [Development](DEVELOPMENT.md) | Local validation, tool requirements, and the PR workflow |
+| [Measurement](MEASUREMENT.md) | Trade journal format, performance metrics, and the analyzer |
 | [Contributing](../CONTRIBUTING.md) | Contribution and review policy |
 
 ## Retained Japanese reference guides
