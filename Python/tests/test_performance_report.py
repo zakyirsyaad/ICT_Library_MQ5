@@ -20,6 +20,7 @@ sys.path.insert(0, str(PYTHON_DIR))
 
 SCHEMA_PATH = ROOT / "schemas/trade-journal.schema.json"
 FIXTURE = ROOT / "tests/fixtures/trade-journal-v1.jsonl"
+NULLS_FIXTURE = ROOT / "tests/fixtures/trade-journal-v1-nulls.jsonl"
 EXPECTED = ROOT / "tests/fixtures/trade-journal-v1.expected.txt"
 REPORT_SCRIPT = PYTHON_DIR / "16_performance_report.py"
 
@@ -860,6 +861,103 @@ class ReviewFixTests(unittest.TestCase):
         text = self.report.render_report(
             self.report.build_report(trades, warnings, NO_FILTERS))
         self.assertIn("duplicate_position", text)
+
+
+class NullableFieldsTests(unittest.TestCase):
+    """Fields a producer cannot compute must be null, never a plausible zero.
+
+    zone_percent 0.0 means "at the swing low", in_ote false means "evaluated and
+    outside the zone", and mfe 0.0 means "price never moved favourably". An EA
+    that does not evaluate premium/discount at all would otherwise be forced to
+    assert all three, and the analyzer would report those assertions as findings.
+    """
+
+    NULLABLE = ("zone_percent", "in_ote", "mfe", "mae")
+
+    def setUp(self):
+        self.report = load_report_module()
+        self.schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+    def test_nulls_fixture_conforms_to_schema(self):
+        rows = [json.loads(line) for line in
+                NULLS_FIXTURE.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(rows), 3)
+        for row in rows:
+            jsonschema.validate(row, self.schema)
+
+    def test_schema_declares_exactly_these_fields_nullable(self):
+        properties = self.schema["properties"]
+        nullable = {
+            name for name, spec in properties.items()
+            if isinstance(spec.get("type"), list) and "null" in spec["type"]
+        }
+        self.assertEqual(nullable, set(self.NULLABLE))
+
+    def test_parser_accepts_null_in_nullable_fields(self):
+        trades, warnings = self.report.load_journal(NULLS_FIXTURE)
+        self.assertEqual(len(trades), 3)
+        self.assertEqual([w.code for w in warnings], [])
+        first = trades[0]
+        for name in self.NULLABLE:
+            self.assertIsNone(getattr(first, name), name)
+
+    def test_parser_keeps_non_null_values_alongside_nulls(self):
+        trades, _ = self.report.load_journal(NULLS_FIXTURE)
+        self.assertAlmostEqual(trades[1].mfe, 2.0, places=9)
+        self.assertAlmostEqual(trades[1].mae, -5.0, places=9)
+        self.assertAlmostEqual(trades[2].zone_percent, 31.0, places=9)
+        self.assertIs(trades[2].in_ote, True)
+        self.assertIsNone(trades[1].zone_percent)
+
+    def test_parser_still_rejects_null_in_a_required_number(self):
+        rows = [json.loads(line) for line in
+                NULLS_FIXTURE.read_text(encoding="utf-8").splitlines() if line.strip()]
+        rows[0]["net_profit"] = None
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_journal(tmp, rows)
+            trades, warnings = self.report.load_journal(path)
+        self.assertEqual(len(trades), 2)
+        self.assertIn("rejected_row", [w.code for w in warnings])
+
+    def test_nulls_fixture_balances_are_internally_consistent(self):
+        """Guards the fixture itself: 500 +10 -> 510 -5 -> 505 +8, no divergence.
+
+        Asserts the row count first. Without it this test passes vacuously
+        whenever the parser rejects every row, which is exactly the state it is
+        meant to detect the absence of.
+        """
+        trades, warnings = self.report.load_journal(NULLS_FIXTURE)
+        self.assertEqual(len(trades), 3)
+        self.assertNotIn("balance_divergence", [w.code for w in warnings])
+        self.assertNotIn("inconsistent_pnl", [w.code for w in warnings])
+
+    def test_exit_quality_skips_null_excursions(self):
+        trades, _ = self.report.load_journal(NULLS_FIXTURE)
+        quality = self.report.compute_exit_quality(trades)
+        # mfe non-null: 2.0, 8.0 -> median 5.0. Row 1 is skipped, not read as 0.
+        self.assertAlmostEqual(quality["median_mfe"], 5.0, places=9)
+        # mae non-null: -5.0, -1.0 -> median -3.0
+        self.assertAlmostEqual(quality["median_mae"], -3.0, places=9)
+        # Row 3 only: mfe 8.0 >= |2656-2648|. Row 1 has no mfe, so it cannot count.
+        self.assertEqual(quality["tp_reached_before_sl_count"], 1)
+        # Row 2 only: mae -5.0 <= -|2652-2647|
+        self.assertEqual(quality["sl_exceeded_before_favourable_count"], 1)
+
+    def test_all_null_excursions_give_zero_medians_not_a_crash(self):
+        trades, _ = self.report.load_journal(NULLS_FIXTURE)
+        quality = self.report.compute_exit_quality(trades[:1])
+        self.assertEqual(quality["median_mfe"], 0.0)
+        self.assertEqual(quality["median_mae"], 0.0)
+        self.assertEqual(quality["tp_reached_before_sl_count"], 0)
+        self.assertEqual(quality["sl_exceeded_before_favourable_count"], 0)
+
+    def test_report_renders_a_journal_with_nulls(self):
+        trades, warnings = self.report.load_journal(NULLS_FIXTURE)
+        report = self.report.build_report(trades, warnings, NO_FILTERS)
+        json.dumps(report, allow_nan=False)
+        text = self.report.render_report(report)
+        self.assertIn("DATA QUALITY", text)
+        self.assertIn("3", text)
 
 
 if __name__ == "__main__":

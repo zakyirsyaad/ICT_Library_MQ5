@@ -100,28 +100,31 @@
     "realized_risk_pct": {
       "type": "number",
       "minimum": 0,
-      "description": "Actual outcome as a percentage of balance_at_open. Meaningful for losing trades; the gap against intended_risk_pct is what exposes lot-step granularity limits."
+      "description": "Actual outcome as a percentage of balance_at_open. Convention: for a losing trade it is (-net_profit / balance_at_open) * 100; for a winning or break-even trade it is 0.0, because no capital was lost and a positive figure would not describe risk. The gap against intended_risk_pct is what exposes lot-step granularity limits, and only losing trades carry that information."
     },
     "mfe": {
-      "type": "number",
+      "type": ["number", "null"],
       "minimum": 0,
-      "description": "Maximum favourable excursion in price units, measured from entry_price over the bars the position was open. Non-negative by definition."
+      "description": "Maximum favourable excursion in price units, measured from entry_price over the bars the position was open. Non-negative by definition. null when the excursion could not be computed, for example because bar history was unavailable; 0.0 is a real measurement meaning price never moved favourably, and the two must not be interchanged."
     },
     "mae": {
-      "type": "number",
+      "type": ["number", "null"],
       "maximum": 0,
-      "description": "Maximum adverse excursion in price units, measured from entry_price. Non-positive by definition, so a stop at distance d is breached when mae <= -d."
+      "description": "Maximum adverse excursion in price units, measured from entry_price. Non-positive by definition, so a stop at distance d is breached when mae <= -d. null when the excursion could not be computed; 0.0 means price never moved adversely."
     },
     "htf_trend": {"type": "string", "enum": ["bullish", "bearish", "ranging", "unknown"]},
     "zone_percent": {
-      "type": "number",
-      "description": "CSmcPremiumDiscount::GetZonePercent() at entry: 0 = swing low, 50 = equilibrium, 100 = swing high."
+      "type": ["number", "null"],
+      "description": "CSmcPremiumDiscount::GetZonePercent() at entry: 0 = swing low, 50 = equilibrium, 100 = swing high. null when the producing EA does not evaluate premium/discount at all; 0 is a real measurement meaning price sat at the swing low, so writing 0 for 'not computed' would assert something false."
     },
-    "in_ote": {"type": "boolean", "description": "CSmcOptimalTradeEntry::IsInOTEZone() at entry."},
+    "in_ote": {
+      "type": ["boolean", "null"],
+      "description": "CSmcOptimalTradeEntry::IsInOTEZone() at entry. null when the producing EA does not evaluate the OTE zone; false means it was evaluated and price was outside it."
+    },
     "zone_types": {
       "type": "string",
       "minLength": 1,
-      "description": "Pipe-delimited overlapping zone types at entry, e.g. \"OB|BPR|IFVG\". \"none\" when no zone qualified; never an empty string."
+      "description": "Pipe-delimited overlapping zone types at entry, e.g. \"OB|BPR|IFVG\". \"none\" when zones were evaluated and none qualified, \"unknown\" when the producing EA does not evaluate zones at all; the two mean different things. Never an empty string."
     },
     "trigger": {
       "type": "string",

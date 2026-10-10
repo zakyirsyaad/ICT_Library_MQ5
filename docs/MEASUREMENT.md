@@ -51,8 +51,16 @@ Semantics that are easy to get wrong:
   level are excluded from the excursion counts rather than treated as instantly reached.
 - **`mfe` is non-negative and `mae` is non-positive**, both in price units measured from
   `entry_price`. The sign convention is part of the contract.
+- **Four fields are nullable**: `zone_percent`, `in_ote`, `mfe`, and `mae`. `null` means
+  the producer could not compute the value; `0` and `false` are measurements. A producer
+  that does not evaluate premium/discount or the OTE zone must write `null`, because
+  `zone_percent: 0` asserts "price sat at the swing low" and `in_ote: false` asserts
+  "evaluated and outside the zone". The analyzer excludes null excursions from medians
+  and from the target-reached and stop-breached counts rather than reading them as zero.
 - **`intended_risk_pct` is what the EA asked for; `realized_risk_pct` is what happened**,
   as a percentage of `balance_at_open`. The gap between them is the point of the field.
+  A winning or break-even trade records `realized_risk_pct` as `0.0`: no capital was
+  lost, and a positive figure would not describe risk.
 - **`variant` labels which strategy layers were active** and `config_hash` identifies the
   parameter set. Without them, two runs cannot be compared and a saved report cannot be
   traced back to its inputs.
@@ -208,6 +216,11 @@ field and a truncated final line. Following the convention of
 [snapshot-v1.json](../tests/fixtures/snapshot-v1.json), it is a contract fixture: its
 identifiers are symbolic and its values are chosen to exercise the format, not to report
 observed market results.
+
+[tests/fixtures/trade-journal-v1-nulls.jsonl](../tests/fixtures/trade-journal-v1-nulls.jsonl)
+is a second, separate fixture covering the nullable fields and the metrics that must skip
+them. It is kept apart deliberately: the first fixture's every aggregate value is verified
+by hand, and adding rows to it would silently change all of them.
 
 ## Related
 

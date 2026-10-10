@@ -77,11 +77,11 @@ class Trade:
     margin_used: float
     intended_risk_pct: float
     realized_risk_pct: float
-    mfe: float
-    mae: float
+    mfe: float | None
+    mae: float | None
     htf_trend: str
-    zone_percent: float
-    in_ote: bool
+    zone_percent: float | None
+    in_ote: bool | None
     zone_types: str
     trigger: str
     session: str
@@ -119,6 +119,13 @@ _NON_NEGATIVE = (
     "realized_risk_pct", "mfe", "bars_held", "confluence_count",
 )
 _NON_POSITIVE = ("mae",)
+
+# Fields whose absence is a fact about the producer, not a measurement of zero.
+# Mirrors the ["number","null"] / ["boolean","null"] types in the schema. An EA
+# that does not evaluate premium/discount must write null: 0.0 would assert
+# "price sat at the swing low" and false would assert "evaluated, outside the
+# zone", and the analyzer would report either as a finding.
+_NULLABLE = frozenset({"zone_percent", "in_ote", "mfe", "mae"})
 
 
 @dataclass(frozen=True)
@@ -161,6 +168,10 @@ def _validate_types(row: dict, problems: list[str]) -> None:
         if not _is_int(row[name]):
             problems.append(f"{name} must be an integer")
     for name in _NUM_FIELDS:
+        if row[name] is None:
+            if name not in _NULLABLE:
+                problems.append(f"{name} must be a number, not null")
+            continue
         if not _is_number(row[name]):
             problems.append(f"{name} must be a number")
         elif not math.isfinite(row[name]):
@@ -169,6 +180,10 @@ def _validate_types(row: dict, problems: list[str]) -> None:
         if not isinstance(row[name], str) or not row[name]:
             problems.append(f"{name} must be a non-empty string")
     for name in _BOOL_FIELDS:
+        if row[name] is None:
+            if name not in _NULLABLE:
+                problems.append(f"{name} must be a boolean, not null")
+            continue
         if not isinstance(row[name], bool):
             problems.append(f"{name} must be a boolean")
     for name, allowed in _ENUMS.items():
@@ -582,7 +597,9 @@ def compute_exit_quality(trades: Sequence[Trade]) -> dict[str, object]:
     suggests whether stops sit too close to entry.
 
     Both counts skip trades with no level set (`tp` or `sl` of 0), because 0
-    means "unset" in this contract and is not a price at distance zero.
+    means "unset" in this contract and is not a price at distance zero. They
+    also skip trades whose excursion is `null`, because a producer that could
+    not measure it is not asserting that price never reached the level.
 
     Medians are used rather than means so a single excursion outlier cannot
     drag the summary. `exit_reason_counts` always emits every reason in
@@ -592,18 +609,24 @@ def compute_exit_quality(trades: Sequence[Trade]) -> dict[str, object]:
     counts = {reason: 0 for reason in EXIT_REASONS}
     for trade in trades:
         counts[trade.exit_reason] += 1
-    mfe_values = [trade.mfe for trade in trades]
-    mae_values = [trade.mae for trade in trades]
+    # Null excursions are excluded rather than read as zero. A producer that
+    # could not compute them says so, and treating that as "price never moved"
+    # would drag both medians toward zero and hide the trades that did move.
+    mfe_values = [trade.mfe for trade in trades if trade.mfe is not None]
+    mae_values = [trade.mae for trade in trades if trade.mae is not None]
     return {
         "exit_reason_counts": counts,
         "tp_reached_before_sl_count": sum(
             1 for trade in trades
             if trade.tp > 0
+            and trade.mfe is not None
             and trade.mfe >= abs(trade.tp - trade.entry_price)
         ),
         "sl_exceeded_before_favourable_count": sum(
             1 for trade in trades
-            if trade.sl > 0 and trade.mae <= -abs(trade.entry_price - trade.sl)
+            if trade.sl > 0
+            and trade.mae is not None
+            and trade.mae <= -abs(trade.entry_price - trade.sl)
         ),
         "median_mfe": statistics.median(mfe_values) if mfe_values else 0.0,
         "median_mae": statistics.median(mae_values) if mae_values else 0.0,
