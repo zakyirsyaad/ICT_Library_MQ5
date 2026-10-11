@@ -20,6 +20,23 @@ commissions, and margin it actually applied, and only the terminal can report th
 faithfully. The analyzer never re-derives a trade outcome and never reimplements
 detection. It reads a file that conforms to the schema and reports on it.
 
+The writer is `CSmcTradeJournal` in
+[Include/SMC/Utils/TradeJournal.mqh](../Include/SMC/Utils/TradeJournal.mqh), a
+static-method-only utility in the same family as `CSmcDataExporter` and
+`CSmcSnapshotExporter`. It writes under `FILE_COMMON`, so journals land in the terminal's
+`Common/Files` directory and are reachable from Python without copying.
+`CSmcTradeJournal::JournalFilename(magic)` builds the conventional name for one run —
+`trade-journal-<magic>-<chart>-<yyyymmdd-hhmmss>.jsonl` — and should be called once per
+run, not per append.
+
+Two of its helpers exist because the library's own human-readable names are **not** the
+contract's tokens. `CSmcKillZone::GetSessionName` returns `"New York"`,
+`"LDN-NY Overlap"` and `"None"`, three of the five values the schema rejects, and
+`SmcDirectionName` returns `"neutral"` where the schema wants `"ranging"`. Fill the
+`session` and `htf_trend` fields through `CSmcTradeJournal::SessionToken` and
+`CSmcTradeJournal::TrendToken` instead. Writing a rejected value does not raise: the row
+simply disappears into a `rejected_row` warning and leaves every metric.
+
 ## Journal format
 
 A journal is UTF-8 JSON Lines: one closed trade per line, appended as positions close.

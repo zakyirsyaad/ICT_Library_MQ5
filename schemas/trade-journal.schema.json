@@ -132,8 +132,8 @@
     },
     "session": {
       "type": "string",
-      "enum": ["Asian", "London", "NewYork", "none", "unknown"],
-      "description": "Broker-local session label at entry. Labels are not time-zone conversions."
+      "enum": ["Asian", "London", "NewYork", "ldn_ny_overlap", "none", "unknown"],
+      "description": "Broker-local session label at entry, produced by CSmcTradeJournal::SessionToken. Labels are not time-zone conversions. Note that CSmcKillZone::GetSessionName returns human-readable names (\"New York\", \"LDN-NY Overlap\", \"None\") that this enum deliberately does not accept."
     },
     "confluence_score": {"type": "number"},
     "confluence_count": {"type": "integer", "minimum": 0}

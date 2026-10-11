@@ -110,7 +110,7 @@ _ENUMS = {
     "exit_reason": ("sl", "tp", "signal", "time_stop", "be_stop", "manual", "unknown"),
     "htf_trend": ("bullish", "bearish", "ranging", "unknown"),
     "trigger": ("displacement", "mss", "po3_distribution", "liq_sweep", "none", "unknown"),
-    "session": ("Asian", "London", "NewYork", "none", "unknown"),
+    "session": ("Asian", "London", "NewYork", "ldn_ny_overlap", "none", "unknown"),
 }
 
 _POSITIVE = ("lot", "entry_price", "exit_price", "balance_at_open", "equity_at_open")

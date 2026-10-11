@@ -998,11 +998,13 @@ class Mql5CrossLanguageTests(unittest.TestCase):
                 jsonschema.validate(json.loads(line), schema)
 
     def test_mql5_number_precision_survives_the_round_trip(self):
-        """%.17g is what keeps gross + commission + swap equal to net.
+        """The captured bytes carry the exact binary64 spelling.
 
-        The captured commission is -0.34999999999999998, the exact binary64
-        nearest to -0.35. A lossy format would break the identity the analyzer
-        checks, and every row would warn.
+        -0.34999999999999998 is the double nearest -0.35, and %.17g reproduces
+        it exactly. Note this does not prove 17 digits are *needed* for the
+        P&L identity: the analyzer allows a one-cent tolerance, so %.2f would
+        also satisfy it. The genuine precision pin is the MQL5-side 0.1 + 0.2
+        case, which no shorter format survives.
         """
         self.assertEqual(self.trades[0].commission, -0.34999999999999998)
         self.assertEqual(
@@ -1045,6 +1047,26 @@ class Mql5CrossLanguageTests(unittest.TestCase):
         verdict = self.report.compute_risk_verdict(self.trades)
         self.assertEqual(verdict["n_losers"], 0)
         self.assertEqual(verdict["verdict"], "insufficient_data")
+
+    def test_schema_session_enum_matches_the_mql5_tokens(self):
+        """Two-sided pin on the session vocabulary.
+
+        CSmcKillZone::GetSessionName returns "New York", "LDN-NY Overlap" and
+        "None" -- three of the five values this enum rejects -- so filling the
+        journal's `session` field from it would silently drop most trades into
+        rejected_row. CSmcTradeJournal::SessionToken is the mapping to use, and
+        TestTradeJournal.mq5 pins the same six tokens from the MQL5 side.
+        """
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["session"]["enum"],
+                         ["Asian", "London", "NewYork", "ldn_ny_overlap",
+                          "none", "unknown"])
+
+    def test_schema_trend_enum_matches_the_mql5_tokens(self):
+        """SmcDirectionName returns "neutral"; the contract's token is "ranging"."""
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(schema["properties"]["htf_trend"]["enum"],
+                         ["bullish", "bearish", "ranging", "unknown"])
 
     def test_report_renders_mql5_output(self):
         built = self.report.build_report(self.trades, self.warnings, NO_FILTERS)

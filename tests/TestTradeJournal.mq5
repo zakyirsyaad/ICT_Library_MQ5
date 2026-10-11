@@ -97,9 +97,11 @@ SmcTradeRecord MakeRecord()
    return rec;
   }
 
+// Deliberately does NOT clear `line` first. SerializeTrade must clear it even
+// when it rejects the record, or a caller reusing one buffer across trades
+// would still be holding the previous trade's JSON after a rejection.
 bool Serializes(const SmcTradeRecord &rec, string &line)
   {
-   line = "";
    return CSmcTradeJournal::SerializeTrade(rec, line);
   }
 
@@ -216,7 +218,12 @@ void OnStart()
    TestAssert(Serializes(nasty, line), "a record with hostile text serializes");
    TestAssert(StringFind(line, "a\\\"b\\\\c") >= 0, "quotes and backslashes are escaped");
    TestAssert(StringFind(line, "\\u0001") >= 0, "a control character is escaped as \\u0001");
-   TestAssert(StringFind(line, ShortToString(0x4E2D)) >= 0, "non-ASCII text is preserved as UTF-8");
+   // Checked on the in-memory string, before StringToCharArray. The record is
+   // not written to disk here, so this pins the escaping decision rather than
+   // the UTF-8 encoding of non-ASCII bytes; the ASCII path through
+   // StringToCharArray is what ReadJournalBytes proves end to end.
+   TestAssert(StringFind(line, ShortToString(0x4E2D)) >= 0,
+              "non-ASCII text survives escaping unescaped");
 
    // --- numeric precision ---------------------------------------------------
    SmcTradeRecord precise = MakeRecord();
@@ -263,6 +270,95 @@ void OnStart()
    bad = MakeRecord(); bad.openTime = 0;
    TestAssert(!Serializes(bad, line), "reject a missing open time");
 
+   // --- rejection must clear the buffer and write nothing --------------------
+   string buffer;
+   TestAssert(Serializes(tradeRecord, buffer), "a valid record fills the buffer");
+   TestAssert(StringLen(buffer) > 0, "the buffer holds the serialization");
+   SmcTradeRecord invalidTrade = MakeRecord();
+   invalidTrade.lot = 0.0;
+   TestAssert(!Serializes(invalidTrade, buffer), "an invalid record is rejected");
+   TestEqual(StringLen(buffer), 0,
+             "rejection clears the buffer instead of leaving the previous trade in it");
+
+   FileDelete(name, FILE_COMMON);
+   TestAssert(CSmcTradeJournal::Open(name, handle), "open a journal for the rejection test");
+   TestAssert(CSmcTradeJournal::AppendTrade(handle, tradeRecord), "append the valid trade first");
+   TestAssert(!CSmcTradeJournal::AppendTrade(handle, invalidTrade),
+              "AppendTrade refuses a record the analyzer would reject");
+   CSmcTradeJournal::Close(handle);
+   TestEqual(CountLines(ReadJournalBytes(name)), 1,
+             "a refused record wrote no bytes and left no partial line");
+   TestAssert(!CSmcTradeJournal::AppendLine(handle, "{\"n\":1}\n"),
+              "append after Close fails on the stale handle instead of writing nowhere");
+   FileDelete(name, FILE_COMMON);
+
+   TestAssert(!CSmcTradeJournal::Open("", handle), "reject an empty filename");
+   TestAssert(handle == INVALID_HANDLE, "a rejected empty name leaves the handle invalid");
+
+   // --- an unpopulated record must not fabricate measurements ---------------
+   // The constructor, not MQL5's zero-initialisation, is what makes "not
+   // computed" the default. Without it a PR 3 caller that misses mfe on a
+   // CopyRates failure would journal 0.0, meaning "price never moved
+   // favourably", and Validate would accept it.
+   SmcTradeRecord sparse;
+   sparse.ticket = 1;
+   sparse.positionId = 1;
+   sparse.symbol = "XAUUSD";
+   sparse.timeframe = "M15";
+   sparse.magic = 1;
+   sparse.variant = "sparse";
+   sparse.configHash = "0000000000000000";
+   sparse.openTime = D'2026.09.21 08:00:00';
+   sparse.closeTime = D'2026.09.21 09:00:00';
+   sparse.direction = 1;
+   sparse.lot = 0.01;
+   sparse.entryPrice = 2650.0;
+   sparse.exitPrice = 2655.0;
+   sparse.exitReason = "signal";
+   sparse.balanceAtOpen = 500.0;
+   sparse.equityAtOpen = 500.0;
+   sparse.htfTrend = "unknown";
+   sparse.zoneTypes = "unknown";
+   sparse.trigger = "unknown";
+   sparse.session = "unknown";
+   string sparseJson;
+   TestAssert(Serializes(sparse, sparseJson), "a sparsely populated record serializes");
+   TestAssert(StringFind(sparseJson, "\"mfe\":null") >= 0, "an unset mfe is null, not 0");
+   TestAssert(StringFind(sparseJson, "\"mae\":null") >= 0, "an unset mae is null, not 0");
+   TestAssert(StringFind(sparseJson, "\"zone_percent\":null") >= 0,
+              "an unset zone_percent is null, not 0");
+   TestAssert(StringFind(sparseJson, "\"in_ote\":null") >= 0,
+              "an unset in_ote is null, not false");
+
+   // --- schema-legal enum tokens --------------------------------------------
+   // CSmcKillZone::GetSessionName is deliberately NOT used to fill `session`:
+   // it returns "New York", "LDN-NY Overlap" and "None", three of five values
+   // the schema rejects. These tokens are the contract; the Python suite pins
+   // the same set against schemas/trade-journal.schema.json.
+   TestAssert(CSmcTradeJournal::SessionToken(SESSION_NONE) == "none", "SESSION_NONE token");
+   TestAssert(CSmcTradeJournal::SessionToken(SESSION_ASIAN) == "Asian", "SESSION_ASIAN token");
+   TestAssert(CSmcTradeJournal::SessionToken(SESSION_LONDON) == "London", "SESSION_LONDON token");
+   TestAssert(CSmcTradeJournal::SessionToken(SESSION_NEWYORK) == "NewYork",
+              "SESSION_NEWYORK token has no space, unlike GetSessionName");
+   TestAssert(CSmcTradeJournal::SessionToken(SESSION_LDN_NY_OL) == "ldn_ny_overlap",
+              "SESSION_LDN_NY_OL has its own token rather than borrowing London or NewYork");
+   TestAssert(CSmcTradeJournal::SessionToken((ENUM_SMC_SESSION)99) == "unknown",
+              "an out-of-range session degrades to unknown");
+   TestAssert(CSmcTradeJournal::TrendToken(SMC_TREND_BULLISH) == "bullish", "bullish token");
+   TestAssert(CSmcTradeJournal::TrendToken(SMC_TREND_BEARISH) == "bearish", "bearish token");
+   TestAssert(CSmcTradeJournal::TrendToken(SMC_TREND_RANGING) == "ranging",
+              "ranging, not the neutral that SmcDirectionName returns");
+   TestAssert(CSmcTradeJournal::TrendToken((ENUM_SMC_TREND)99) == "unknown",
+              "an out-of-range trend degrades to unknown");
+
+   // --- run filename ---------------------------------------------------------
+   const string runName = CSmcTradeJournal::JournalFilename(20260209);
+   TestAssert(StringFind(runName, "trade-journal-20260209-") == 0,
+              "the run filename carries the magic number");
+   TestAssert(StringFind(runName, ".jsonl") == StringLen(runName) - 6,
+              "the run filename has the journal extension");
+   TestAssert(CSmcSnapshotExporter::SafePath(runName), "the generated name is safe to open");
+
    // Byte-level contract, pinned jointly with
    // tests/fixtures/trade-journal-v1-mql5.jsonl. That fixture is the captured
    // output of exactly these two records and is loaded by the Python analyzer,
@@ -281,8 +377,12 @@ void OnStart()
    TestEqual(StringLen(nullsJson), 800, "nullable serialization matches the captured length");
    TestAssert(StringFind(baselineJson, "\"config_hash\":\"ad40da8852c20a64\"") >= 0,
               "config_hash matches the captured fixture");
+   // Pins the exact binary64 spelling of the captured bytes. Note this does NOT
+   // prove 17 digits are needed for the P&L identity: the analyzer allows a
+   // one-cent tolerance, so %.2f would also satisfy it. The real precision pin
+   // is the 0.1 + 0.2 case above, which no shorter format can survive.
    TestAssert(StringFind(baselineJson, "\"commission\":-0.34999999999999998") >= 0,
-              "17 significant digits are preserved, so gross+commission+swap still equals net");
+              "commission keeps its exact binary64 spelling");
 
    TestFinish();
   }

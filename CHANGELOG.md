@@ -14,6 +14,8 @@ Changes are recorded here before they are released. Entries describe completed w
 - Local commit validation covering Python, MQL5 static checks, MetaEditor compilation, detector runtime tests, language examples, and documentation links.
 - Shared Git hooks, commit-bound `local/validation` status publication, and contribution rules for small commits, frequent pushes, PR review, and squash merges into protected `main`.
 - Contributor conduct guidance, a private security reporting policy, and bug and feature request forms with reproducible environment and data requirements.
+- A versioned trade journal contract and schema, an append-only MQL5 writer, and a Python analyzer reporting expectancy, cost, realized risk against intended risk, exit quality, and per-variant grouping for ablation.
+- Nullable journal fields for measurements a producer cannot compute, so an unevaluated premium/discount zone or an unavailable excursion is recorded as absent rather than as a plausible zero.
 
 ### Changed
 
