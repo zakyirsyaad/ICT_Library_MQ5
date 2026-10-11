@@ -960,5 +960,98 @@ class NullableFieldsTests(unittest.TestCase):
         self.assertIn("3", text)
 
 
+MQL5_FIXTURE = ROOT / "tests/fixtures/trade-journal-v1-mql5.jsonl"
+
+
+class Mql5CrossLanguageTests(unittest.TestCase):
+    """Bytes produced by CSmcTradeJournal, loaded by the Python analyzer.
+
+    This fixture is captured output from tests/TestTradeJournal.mq5, not
+    hand-written, so it is the only place where the two sides of the contract
+    are proved to agree. The MQL5 test pins the same bytes by length and by
+    two exact substrings; if serialization changes, both must be re-captured.
+    """
+
+    def setUp(self):
+        self.report = load_report_module()
+        self.trades, self.warnings = self.report.load_journal(MQL5_FIXTURE)
+
+    def test_every_record_is_accepted_without_rejection(self):
+        self.assertEqual(len(self.trades), 2)
+        codes = [w.code for w in self.warnings]
+        for fatal in ("rejected_row", "truncated_line", "inconsistent_pnl"):
+            self.assertNotIn(fatal, codes)
+
+    def test_only_the_warnings_the_fixture_deliberately_causes_appear(self):
+        """The nulls record reuses the baseline's id and balance on purpose.
+
+        Asserting the exact set matters: an empty assertion would also pass if
+        the parser silently dropped a record.
+        """
+        self.assertEqual(sorted(w.code for w in self.warnings),
+                         ["balance_divergence", "duplicate_position"])
+
+    def test_rows_conform_to_the_published_schema(self):
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        for line in MQL5_FIXTURE.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                jsonschema.validate(json.loads(line), schema)
+
+    def test_mql5_number_precision_survives_the_round_trip(self):
+        """%.17g is what keeps gross + commission + swap equal to net.
+
+        The captured commission is -0.34999999999999998, the exact binary64
+        nearest to -0.35. A lossy format would break the identity the analyzer
+        checks, and every row would warn.
+        """
+        self.assertEqual(self.trades[0].commission, -0.34999999999999998)
+        self.assertEqual(
+            self.trades[0].gross_profit + self.trades[0].commission + self.trades[0].swap,
+            self.trades[0].net_profit)
+        self.assertEqual(self.trades[0].entry_price, 2650.0)
+
+    def test_nulls_from_mql5_arrive_as_none_not_zero(self):
+        self.assertEqual(self.trades[0].mfe, 10.0)
+        self.assertIs(self.trades[0].in_ote, True)
+        self.assertEqual(self.trades[0].zone_percent, 32.5)
+        for name in ("mfe", "mae", "zone_percent", "in_ote"):
+            self.assertIsNone(getattr(self.trades[1], name), name)
+
+    def test_broker_local_timestamps_parse_without_a_timezone(self):
+        opened = self.trades[0].open_time
+        self.assertEqual((opened.year, opened.month, opened.day), (2026, 9, 21))
+        self.assertEqual((opened.hour, opened.minute, opened.second), (8, 0, 0))
+        self.assertIsNone(opened.tzinfo)
+
+    def test_config_hash_is_the_full_64_bit_value(self):
+        # Captured before the %016x truncation fix this was "0000000052c20a64".
+        self.assertEqual(self.trades[0].config_hash, "ad40da8852c20a64")
+        self.assertNotEqual(self.trades[0].config_hash[:8], "00000000")
+
+    def test_metrics_compute_over_mql5_output(self):
+        metrics = self.report.compute_metrics(self.trades)
+        self.assertEqual(metrics["trade_count"], 2)
+        self.assertAlmostEqual(metrics["total_net"], 20.0, places=9)
+        self.assertAlmostEqual(metrics["win_rate"], 1.0, places=9)
+        self.assertEqual(metrics["profit_factor"], float("inf"))
+        quality = self.report.compute_exit_quality(self.trades)
+        # Only the baseline record has an mfe, so it alone can reach its target.
+        self.assertEqual(quality["tp_reached_before_sl_count"], 1)
+        self.assertEqual(quality["sl_exceeded_before_favourable_count"], 0)
+        self.assertAlmostEqual(quality["median_mfe"], 10.0, places=9)
+        self.assertAlmostEqual(quality["median_mae"], -1.2, places=9)
+
+    def test_risk_verdict_needs_a_loser_and_this_fixture_has_none(self):
+        verdict = self.report.compute_risk_verdict(self.trades)
+        self.assertEqual(verdict["n_losers"], 0)
+        self.assertEqual(verdict["verdict"], "insufficient_data")
+
+    def test_report_renders_mql5_output(self):
+        built = self.report.build_report(self.trades, self.warnings, NO_FILTERS)
+        json.dumps(built, allow_nan=False)
+        self.assertIn("Trade Journal Performance Report",
+                      self.report.render_report(built))
+
+
 if __name__ == "__main__":
     unittest.main()
